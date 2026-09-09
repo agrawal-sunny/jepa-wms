@@ -35,8 +35,8 @@ def build_causal_attention_mask(T, H, W):
     return mask
 
 
-def build_action_block_causal_attention_mask(T, H, W, add_tokens=1):
-    N_T = add_tokens + (H * W)
+def build_action_block_causal_attention_mask(T, H, W, add_tokens=1, num_views=1):
+    N_T = add_tokens + num_views * (H * W)
     N = T * N_T
     mask = torch.zeros(N, N).bool()
     mask_block = torch.ones(N_T, N_T).bool()
@@ -144,6 +144,7 @@ class RoPEAttention(nn.Module):
         use_sdpa=True,
         is_causal=False,
         grid_size=16,
+        num_views=1,
     ):
         super().__init__()
         self.num_heads = num_heads
@@ -161,29 +162,38 @@ class RoPEAttention(nn.Module):
         self.w_dim = int(2 * ((head_dim // 3) // 2))
         self.grid_size = grid_size
         self.is_causal = is_causal
+        # Multiview: views are concatenated per frame (num_views * H * W
+        # tokens/frame instead of H * W). Every view at a given frame gets the
+        # same (height, width) rotary position -- RoPE only disambiguates
+        # frame index, not which view a token came from.
+        self.num_views = num_views
 
-    def _get_frame_pos(self, ids, H_patches, W_patches):
-        tokens_per_frame = int(H_patches * W_patches)
+    def _get_frame_pos(self, ids, H_patches, W_patches, num_views=1):
+        tokens_per_frame = int(H_patches * W_patches) * num_views
         return ids // tokens_per_frame
 
-    def _get_height_pos(self, ids, H_patches, W_patches):
+    def _get_height_pos(self, ids, H_patches, W_patches, num_views=1):
         # Remove frame component from ids
-        tokens_per_frame = int(H_patches * W_patches)
+        tokens_per_frame = int(H_patches * W_patches) * num_views
         tokens_per_row = W_patches
-        frame_ids = self._get_frame_pos(ids, H_patches, W_patches)
+        frame_ids = self._get_frame_pos(ids, H_patches, W_patches, num_views)
         ids = ids - tokens_per_frame * frame_ids
+        # Fold the view component back onto the same H*W spatial grid.
+        ids = ids % int(H_patches * W_patches)
         # --
         return ids // tokens_per_row
 
-    def separate_positions(self, ids, H_patches, W_patches):
-        tokens_per_frame = int(H_patches * W_patches)
+    def separate_positions(self, ids, H_patches, W_patches, num_views=1):
+        tokens_per_frame = int(H_patches * W_patches) * num_views
         tokens_per_row = W_patches
-        frame_ids = self._get_frame_pos(ids, H_patches, W_patches)
+        frame_ids = self._get_frame_pos(ids, H_patches, W_patches, num_views)
         # --
-        height_ids = self._get_height_pos(ids, H_patches, W_patches)
+        height_ids = self._get_height_pos(ids, H_patches, W_patches, num_views)
         # --
-        # Remove frame component from ids (1st term) and height component (2nd term)
-        width_ids = (ids - tokens_per_frame * frame_ids) - tokens_per_row * height_ids
+        # Remove frame component from ids, then fold the view component onto
+        # the same H*W spatial grid before removing the height component.
+        within_frame_ids = (ids - tokens_per_frame * frame_ids) % int(H_patches * W_patches)
+        width_ids = within_frame_ids - tokens_per_row * height_ids
         return 1.0 * frame_ids, 1.0 * height_ids, 1.0 * width_ids
 
     def forward(self, x, mask=None, attn_mask=None, T=None, H=None, W=None, action_tokens=0):
@@ -192,10 +202,10 @@ class RoPEAttention(nn.Module):
         # -- compute position of each frame token
         if mask is not None:
             mask = mask.unsqueeze(1).repeat(1, self.num_heads, 1)
-            d_mask, h_mask, w_mask = self.separate_positions(mask, H, W)
+            d_mask, h_mask, w_mask = self.separate_positions(mask, H, W, self.num_views)
         else:
-            mask = torch.arange(int(T * H * W), device=x.device)
-            d_mask, h_mask, w_mask = self.separate_positions(mask, H, W)
+            mask = torch.arange(int(T * self.num_views * H * W), device=x.device)
+            d_mask, h_mask, w_mask = self.separate_positions(mask, H, W, self.num_views)
 
         # -- snap spatial positions to grid size
         h_mask *= self.grid_size / H
@@ -203,7 +213,7 @@ class RoPEAttention(nn.Module):
 
         # -- split out action tokens from sequence
         if action_tokens > 0:
-            x = x.view(B, -1, action_tokens + H * W, C)  # [B, T, 1+H*W, D]
+            x = x.view(B, -1, action_tokens + self.num_views * H * W, C)  # [B, T, 1+V*H*W, D]
 
             action_q, action_k, action_v = [], [], []
             for i in range(action_tokens):
@@ -258,7 +268,7 @@ class RoPEAttention(nn.Module):
 
             def merge_(tx, ta):
                 """tx, tx in [B, num_heads, N, D]"""
-                tx = tx.view(B, self.num_heads, T, H * W, -1)  # [B, T, H*W, D]
+                tx = tx.view(B, self.num_heads, T, self.num_views * H * W, -1)  # [B, T, V*H*W, D]
                 ta = ta.view(B, self.num_heads, T, action_tokens, -1)  # [B, T, A, D]
                 return torch.cat([ta, tx], dim=3).flatten(2, 3)
 

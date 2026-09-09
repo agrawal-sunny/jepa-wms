@@ -44,6 +44,9 @@ class VideoWM(nn.Module):
         grid_size=16,
         tubelet_size_enc=2,
         img_size=256,
+        # Multiview: number of camera views concatenated per frame by
+        # encode_obs/forward_pred. 1 = single view (unchanged behavior).
+        num_views=1,
         # Input dimensions
         action_dim=None,
         proprio_dim=None,
@@ -64,6 +67,11 @@ class VideoWM(nn.Module):
         normalize_reps=False,
         # Rollout behavior
         proprio_rollout_mode="predict_proprio",
+        # Continuous LAM action codes are unbounded and can dwarf visual
+        # feature RMS (see lac_wm/reports/wm_pipeline_handoff.md finding #1);
+        # normalize them after the action encoder for every pred_type, not
+        # just AdaLN's own normalize_action_conditioning path.
+        normalize_action_conditioning=False,
         # Optimization parameters
         device=None,
         scaler=None,
@@ -88,6 +96,7 @@ class VideoWM(nn.Module):
         self.grid_size = grid_size
         self.tubelet_size_enc = tubelet_size_enc
         self.img_size = img_size
+        self.num_views = num_views
         # Input dimensions
         self.action_dim = action_dim
         self.proprio_dim = proprio_dim
@@ -110,6 +119,7 @@ class VideoWM(nn.Module):
         self.normalize_reps = normalize_reps
         # Rollout behavior
         self.proprio_rollout_mode = proprio_rollout_mode
+        self.normalize_action_conditioning = normalize_action_conditioning
         # Validation
         if self.enc_type == "dino":
             assert self.batchify_video == True, "batchify_video must be True for dino"
@@ -148,7 +158,12 @@ class VideoWM(nn.Module):
         Encodes an observation into its latent representation.
         This implementation either takes a dict (or Tensordict) with keys
         "visual" and "proprio", or just a visual tensor.
-        Input visual obs: (b t c h w)
+        Input visual obs: (b t c h w), or (b t v c h w) for multiview.
+        Multiview: each view is encoded independently through the same
+        (shared, frozen) encoder -- v is folded into the batch alongside t,
+        never mixed with a view's own c/h/w -- then kept as its own axis in
+        the output so forward_pred's existing "(v h w)" flatten concatenates
+        the per-view token sequences into the predictor's input.
         Possible combinations:
             - self.enc_type == 'dino':
                 - self.dup_image = False, self.batchify_video = True
@@ -162,41 +177,73 @@ class VideoWM(nn.Module):
             proprio = obs.get("proprio")  # Use get() to avoid KeyError if 'proprio' is not present
         else:
             raise ValueError("Input must be a dictionary with keys 'visual' and 'proprio' ")
-        b, t, c, h, w = visual.shape
-        if self.batchify_video:
-            # image encoder flattens the time dimension as batch dimension
-            visual = rearrange(visual, "b t ... -> (b t) ...")
-        if self.dup_image:
-            if not self.batchify_video:
-                visual = visual.repeat_interleave(2, dim=1)  # b, (2 t), c, h, w
+        if self.enc_type == "precomputed":
+            # Dataset already returns DINO patch tokens straight from the
+            # trajectory NPZ (isaac_npz_dset.py's embedding_suffix, written by
+            # preprocess_dino.py) -- shape (b, t, v, n, d) multiview or
+            # (b, t, n, d) single-view, n == grid_size**2. No live encoder
+            # forward pass, unlike the 'dino'/'vjepa' branches below.
+            if visual.ndim == 5:
+                b, t, v, n, d = visual.shape
             else:
-                visual = visual.unsqueeze(2).repeat(1, 1, 2, 1, 1)  # b c 2 h w
-        if self.enc_type == "dino":  # no duplication needed
-            visual_embs = self.encoder(visual)
-            visual_embs = rearrange(
-                visual_embs, "(b t) (h w) d -> b t 1 h w d", b=b, h=self.grid_size, w=self.grid_size
-            )
-        elif self.enc_type == "vjepa":
-            if not self.batchify_video:
-                visual = rearrange(visual, "b t c h w -> b c t h w ")
-            visual_embs = self.encoder(visual)
-            if self.batchify_video:
-                visual_embs = rearrange(
-                    visual_embs, "(b t) (h w) d -> b t 1 h w d", b=b, t=t, h=self.grid_size, w=self.grid_size
+                b, t, n, d = visual.shape
+                v = 1
+                visual = visual.unsqueeze(2)  # b t 1 n d, uniform with multiview
+            if n != self.grid_size**2:
+                raise ValueError(
+                    f"Precomputed visual tokens have {n} patches/frame, but "
+                    f"grid_size={self.grid_size} expects {self.grid_size**2}"
                 )
-            else:
-                visual_embs = rearrange(visual_embs, "b (t h w) d -> b t 1 h w d", h=self.grid_size, w=self.grid_size)
+            visual_embs = rearrange(visual, "b t v (h w) d -> b t v h w d", h=self.grid_size, w=self.grid_size)
         else:
-            raise ValueError("enc_type must be 'dino' or 'vjepa' ")
+            if visual.ndim == 6:
+                b, t, v, c, h, w = visual.shape
+                visual = rearrange(visual, "b t v c h w -> (b v) t c h w")
+            else:
+                b, t, c, h, w = visual.shape
+                v = 1
+            if self.batchify_video:
+                # image encoder flattens the time dimension as batch dimension
+                visual = rearrange(visual, "b t ... -> (b t) ...")
+            if self.dup_image:
+                if not self.batchify_video:
+                    visual = visual.repeat_interleave(2, dim=1)  # b, (2 t), c, h, w
+                else:
+                    visual = visual.unsqueeze(2).repeat(1, 1, 2, 1, 1)  # b c 2 h w
+            if self.enc_type == "dino":  # no duplication needed
+                visual_embs = self.encoder(visual)
+                visual_embs = rearrange(
+                    visual_embs, "(b v t) (h w) d -> b t v h w d", b=b, v=v, h=self.grid_size, w=self.grid_size
+                )
+            elif self.enc_type == "vjepa":
+                if not self.batchify_video:
+                    visual = rearrange(visual, "b t c h w -> b c t h w ")
+                visual_embs = self.encoder(visual)
+                if self.batchify_video:
+                    visual_embs = rearrange(
+                        visual_embs,
+                        "(b v t) (h w) d -> b t v h w d",
+                        b=b,
+                        v=v,
+                        t=t,
+                        h=self.grid_size,
+                        w=self.grid_size,
+                    )
+                else:
+                    visual_embs = rearrange(
+                        visual_embs, "(b v) (t h w) d -> b t v h w d", b=b, v=v, h=self.grid_size, w=self.grid_size
+                    )
+            else:
+                raise ValueError("enc_type must be 'dino', 'vjepa', or 'precomputed' ")
         if self.normalize_reps:
             visual_embs = F.layer_norm(visual_embs, (visual_embs.size(-1),))
         if self.use_proprio and proprio is not None:
-            proprio_emb = self.encode_proprio(proprio)
+            proprio_emb = self.encode_proprio(proprio, views=v)
         else:
             proprio_emb = None
         return TensorDict({"visual": visual_embs, "proprio": proprio_emb})
 
-    def encode_act(self, a):
+    def encode_act(self, a, views=1):
         """
         Input a: (b, num_frames, frameskip * action_dim)
             num_frames must ne multiple of tubelet_size_enc
@@ -208,22 +255,41 @@ class VideoWM(nn.Module):
         the input time dimension is variable, but the constant is that
             Output: (b, grid_depth, 1, model_action_dim)
             where grid_depth is the same for proprio and video features.
+        views: number of concatenated camera views (see encode_obs); when
+            action_conditioning == 'feature', the action embedding is
+            broadcast across every view's patches, not just one view's worth.
         """
+        # AdaLN_vit already applies normalize_action_conditioning itself, end
+        # to end (including when action_encoder_inpred routes raw actions
+        # into its own internal encoder) -- don't also normalize here, which
+        # for action_encoder_inpred would feed AdaLN's internal encoder
+        # already-normalized input instead of the raw actions it expects.
+        normalize_here = self.normalize_action_conditioning and self.pred_type != "AdaLN"
         B, T, D = a.shape
         a = a.reshape(B, -1, self.action_dim)
         if self.action_encoder_inpred:
+            if normalize_here:
+                a = torch.nn.functional.layer_norm(a.float(), (a.shape[-1],)).to(a.dtype)
             return a
         else:
             action = self.action_encoder(a)
+        if normalize_here:
+            # Same normalization AdaLN_vit applies via its own
+            # normalize_action_conditioning flag: LayerNorm with no learned
+            # affine, over the last (feature) axis, computed in float32.
+            action = torch.nn.functional.layer_norm(action.float(), (action.shape[-1],)).to(action.dtype)
         if self.action_conditioning == "feature":
-            action = repeat(action, "b t 1 a -> b t f a", f=self.grid_size**2)
+            action = repeat(action, "b t 1 a -> b t f a", f=self.grid_size**2 * views)
         return action
 
-    def encode_proprio(self, proprio):
+    def encode_proprio(self, proprio, views=1):
         """
         Input: (b, num_frames, proprio_dim)
             num_frames must ne multiple of tubelet_size_enc
         Output: (b, num_frames // tubelet_size_enc, 1, proprio_emb_dim * tubelet_size_enc)
+        views: number of concatenated camera views (see encode_obs); when
+            proprio_encoding == 'feature', the proprio embedding is broadcast
+            across every view's patches, not just one view's worth.
         """
         B, T, D = proprio.shape
         proprio = proprio.reshape(B, -1, self.proprio_dim)
@@ -232,7 +298,7 @@ class VideoWM(nn.Module):
         else:
             proprio = self.proprio_encoder(proprio)
         if self.proprio_encoding == "feature":
-            proprio = repeat(proprio, "b t 1 a -> b t f a", f=self.grid_size**2)
+            proprio = repeat(proprio, "b t 1 a -> b t f a", f=self.grid_size**2 * views)
         return proprio
 
     def encode(self, obs, a):
@@ -247,7 +313,7 @@ class VideoWM(nn.Module):
         video_features = encoded_obs["visual"]
         proprio_features = encoded_obs["proprio"]
         if self.use_action:
-            action_features = self.encode_act(a)
+            action_features = self.encode_act(a, views=video_features.shape[2])
         else:
             action_features = None
         return video_features, proprio_features, action_features
@@ -313,9 +379,19 @@ class VideoWM(nn.Module):
         else:
             B, T, action_tokens, D = action_features.shape
         if self.pred_type == "dino_wm":
+            predictor_module = getattr(self.predictor, "module", self.predictor)
+            feature_views = getattr(predictor_module, "dino_wm_view_fusion", "token") == "feature"
             video_features = rearrange(
-                video_features, "b t v h w d -> b t (v h w) d", h=self.grid_size, w=self.grid_size
+                video_features,
+                "b t v h w d -> b t (h w) (v d)" if feature_views else "b t v h w d -> b t (v h w) d",
+                h=self.grid_size, w=self.grid_size,
             )
+            if feature_views:
+                # Like latent-safety's VideoTransformer: pair camera patches in
+                # channels and append one copy of the shared action/proprio.
+                action_features = action_features[:, :, : H * W]
+                if proprio_features is not None:
+                    proprio_features = proprio_features[:, :, : H * W]
             features = self.concat_obs_act(video_features, action_features, proprio_features)
             features = rearrange(features, "b t p d -> b (t p) d")
             pred_features = self.predictor(features)
@@ -332,8 +408,15 @@ class VideoWM(nn.Module):
             else:
                 pred_proprio_features = None
             pred_video_features = rearrange(
-                pred_video_features, "b t (v h w) d -> b t v h w d", h=self.grid_size, w=self.grid_size
+                pred_video_features,
+                "b t (h w) (v d) -> b t v h w d" if feature_views else "b t (v h w) d -> b t v h w d",
+                h=self.grid_size, w=self.grid_size, v=V,
             )
+            if feature_views:
+                # Keep the public conditioning/loss layout aligned with encode().
+                pred_action_features = pred_action_features.repeat(1, 1, V, 1)
+                if pred_proprio_features is not None:
+                    pred_proprio_features = pred_proprio_features.repeat(1, 1, V, 1)
         elif self.pred_type == "vjepa2_ac":
             pred_video_features, pred_action_features, pred_proprio_features = self.predictor(
                 video_features.flatten(1, 4),  # (b, tau * v * h * w, d)
@@ -350,7 +433,11 @@ class VideoWM(nn.Module):
                 proprio_features,
             )
             pred_video_features = rearrange(
-                pred_video_features, "b t (v h w) d -> b t v h w d", h=self.grid_size, w=self.grid_size, v=1
+                pred_video_features,
+                "b t (v h w) d -> b t v h w d",
+                h=self.grid_size,
+                w=self.grid_size,
+                v=self.num_views
             )
         else:
             raise ValueError(f"self.pred_type should be in ['dino_wm', 'vjepa2_ac', 'AdaLN']")
@@ -377,7 +464,7 @@ class VideoWM(nn.Module):
         proprio_features,
         visual_loss=True,
         shift=1,
-        num_views=1,
+        num_views=None,
         reduce_mean=True,
     ):
         """
@@ -389,7 +476,7 @@ class VideoWM(nn.Module):
         if not self.use_proprio or pred_proprio_features is None:
             proprio_loss = False
         B, T, V, H, W, C = pred_video_features.shape
-        V = num_views
+        V = num_views if num_views is not None else self.num_views
         H, W = self.grid_size, self.grid_size
         pred_video_features = pred_video_features.reshape(B, T, V * H * W, C)
         video_features = video_features.reshape(B, T, V * H * W, C)
@@ -610,7 +697,11 @@ class VideoWM(nn.Module):
                 # Sequential mode: append new action
                 new_act_feats = act_feats_suffix[:, h : h + 1]
                 if action_noise > 0:
-                    new_act_feats = (
+                    # Perturb the real dataset action, don't replace it -- callers pass a
+                    # small action_noise (e.g. 0.05) expecting a "noisy_actions" sanity
+                    # check against slightly-perturbed real actions, not a random-action
+                    # control (that's what setting act_feats to unrelated noise gives).
+                    new_act_feats = new_act_feats + (
                         torch.randn(*new_act_feats.shape).to(new_act_feats.device).to(new_act_feats.dtype)
                         * action_noise
                     )
@@ -715,7 +806,9 @@ class VideoWM(nn.Module):
         """
         self.scaler.unscale_(self.optimizer)
         if self.clip_grad > 0:
-            _grad_norm = torch.nn.utils.clip_grad_norm_(self.parameters(), self.clip_grad)
+            _grad_norm = torch.nn.utils.clip_grad_norm_(
+                self.parameters(), self.clip_grad, error_if_nonfinite=True
+            )
             if self.use_radamw and (_grad_norm > self.clip_grad):
                 logger.info(f"Gradient spike... skipping update {_grad_norm=}")
                 self.optimizer.skip_step()

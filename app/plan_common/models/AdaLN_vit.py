@@ -44,11 +44,13 @@ class FWAdaLNBlock(nn.Module):
         is_causal=False,
         grid_size=16,
         use_rope=False,
+        num_views=1,
         **kwargs,
     ):
         super().__init__()
         self.norm1 = norm_layer(dim)
         self.grid_size = grid_size
+        self.num_views = num_views
         if use_rope:
             self.attn = RoPEAttention(
                 dim,
@@ -60,6 +62,7 @@ class FWAdaLNBlock(nn.Module):
                 is_causal=is_causal,
                 grid_size=grid_size,
                 proj_drop=drop,
+                num_views=num_views,
             )
         else:
             self.attn = Attention(
@@ -94,7 +97,9 @@ class FWAdaLNBlock(nn.Module):
             B, N, D
         """
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
-            self.adaLN_modulation(z).repeat_interleave((self.grid_size**2 + cond_tokens), dim=1).chunk(6, dim=2)
+            self.adaLN_modulation(z)
+            .repeat_interleave((self.num_views * self.grid_size**2 + cond_tokens), dim=1)
+            .chunk(6, dim=2)
         )
         if isinstance(self.attn, RoPEAttention):
             y = self.attn(
@@ -149,6 +154,8 @@ class VisionTransformerAdaLN(nn.Module):
         local_window=(-1, -1, -1),
         use_rope=True,
         action_dim=20,
+        action_emb_dim=0,
+        normalize_action_conditioning=False,
         proprio_dim=10,
         use_proprio=True,
         act_mlp=False,
@@ -160,13 +167,19 @@ class VisionTransformerAdaLN(nn.Module):
         proprio_encoder_inpred=True,
         proprio_tokens=0,  # if proprio_encoding='token', proprio_tokens>0 will be used to encode the proprio input
         action_encoder_inpred=True,
+        # Multiview: number of camera views concatenated per frame (see
+        # VideoWM.encode_obs). RoPE gives every view the same spatial (height,
+        # width) position -- it only disambiguates frame index, not view.
+        num_views=1,
         **kwargs,
     ):
         super().__init__()
         self.attn_depth, self.attn_height, self.attn_width = local_window
         self.predictor_embed_dim = predictor_embed_dim
         self.proprio_encoder_inpred = proprio_encoder_inpred
+        self.num_views = num_views
         self.action_encoder_inpred = action_encoder_inpred
+        self.normalize_action_conditioning = normalize_action_conditioning
 
         # Map input to predictor dimension
         self.predictor_embed = nn.Linear(embed_dim, predictor_embed_dim, bias=True)
@@ -205,7 +218,16 @@ class VisionTransformerAdaLN(nn.Module):
 
         # Initialize encoders
         if self.action_encoder_inpred:
-            self.action_encoder = nn.Linear(action_dim, self.predictor_total_embed_dim, bias=True)
+            # Explicit bottleneck keeps action width independent of proprio features.
+            # Zero preserves the architecture of existing checkpoints/configs.
+            self.action_encoder_output_dim = action_emb_dim or self.predictor_total_embed_dim
+            self.action_encoder = nn.Linear(action_dim, self.action_encoder_output_dim, bias=True)
+            self.action_conditioning_projection = (
+                nn.Linear(self.action_encoder_output_dim, self.predictor_total_embed_dim)
+                if self.action_encoder_output_dim != self.predictor_total_embed_dim else nn.Identity()
+            )
+            logger.info(f"action_dim={action_dim} action_encoder_output_dim={self.action_encoder_output_dim} "
+                        f"adaln_conditioning_dim={self.predictor_total_embed_dim}")
         if self.proprio_encoder_inpred:
             if self.proprio_encoding == "token" and self.proprio_tokens > 0:
                 self.proprio_encoder = nn.Linear(proprio_dim, predictor_embed_dim, bias=True)
@@ -232,6 +254,7 @@ class VisionTransformerAdaLN(nn.Module):
                     attn_drop=attn_drop_rate,
                     drop_path=dpr[i],
                     norm_layer=norm_layer,
+                    num_views=num_views,
                 )
                 for i in range(depth)
             ]
@@ -254,6 +277,7 @@ class VisionTransformerAdaLN(nn.Module):
                 grid_height,
                 grid_width,
                 add_tokens=self.cond_tokens,
+                num_views=self.num_views,
             )
         self.attn_mask = attn_mask
 
@@ -324,9 +348,13 @@ class VisionTransformerAdaLN(nn.Module):
 
         # Encode actions if needed
         if self.action_encoder_inpred:
-            z = self.action_encoder(actions)
+            z = self.action_conditioning_projection(self.action_encoder(actions))
         else:
             z = actions.squeeze(2)  # (b t 1 a) -> (b t a)
+        if self.normalize_action_conditioning:
+            # Continuous LAM codes are unbounded. Normalize after the learned
+            # projections as well, so their growth cannot amplify AdaLN gates.
+            z = torch.nn.functional.layer_norm(z.float(), (z.shape[-1],)).to(z.dtype)
 
         if self.use_proprio and proprio is not None:
             if self.proprio_encoder_inpred:
@@ -373,15 +401,19 @@ class VisionTransformerAdaLN(nn.Module):
                 )
         x = self.predictor_norm(x)
 
+        # N (= num_views * H * W, captured before the proprio/action concat
+        # above) is the real per-frame visual token count; grid_height *
+        # grid_width alone would silently drop the view factor for
+        # num_views > 1.
         if self.use_proprio and proprio is not None:
             if self.proprio_encoding == "token":
-                x = x.view(B, T, self.cond_tokens + self.grid_height * self.grid_width, D)  # [B, T, K+H*W, D]
+                x = x.view(B, T, self.cond_tokens + N, D)  # [B, T, K+V*H*W, D]
                 x, proprio_features = x[:, :, self.cond_tokens :, :], x[:, :, : self.cond_tokens, :]
             elif self.proprio_encoding == "feature":
-                x = x.view(B, T, self.grid_height * self.grid_width, self.predictor_total_embed_dim)
+                x = x.view(B, T, N, self.predictor_total_embed_dim)
                 x, proprio_features = x[:, :, :, : -self.proprio_emb_dim], x[:, :, :, -self.proprio_emb_dim :]
         else:
-            x = x.view(B, T, self.grid_height * self.grid_width, self.predictor_total_embed_dim)
+            x = x.view(B, T, N, self.predictor_total_embed_dim)
             proprio_features = None
 
         x = self.predictor_proj(x)

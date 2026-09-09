@@ -167,6 +167,37 @@ python -c "import torchcodec; print('✓ torchcodec works')"
 
 ### ⚙️ Configuration
 
+#### Isaac Lab NPZ trajectories (Takeoff / Lift-Env)
+
+Trajectories written by `x_embodiment_safety/collect_demonstrations.py` can be
+loaded directly; no HDF5 or MP4 conversion is required. For Takeoff, point
+`JEPAWM_DSET` at the `x_embodiment_safety` repository root and use the Isaac
+dataset adapter:
+
+```yaml
+data:
+  dataset_type: isaac_npz
+  datasets: [IsaacTakeoffFranka]
+  custom:
+    split_ratio: 0.9
+    frameskip: 1
+    action_skip: 1
+    num_hist: 3
+    num_pred: 1
+    normalize_action: false
+  droid:
+    camera_views: [front_cam, wrist_cam]
+```
+
+For Lift-Env, replace `IsaacTakeoffFranka` with
+`IsaacLiftEnvFranka`. UR datasets use `IsaacTakeoffUR` and
+`IsaacLiftEnvUR`. Lift aliases read `/data/sunny/lift_env/{franka,ur}/**/*.npz`
+independently of `JEPAWM_DSET`; set `LIFT_ENV_DATASET_ROOT` to override this root.
+Both tasks use the same required NPZ fields:
+`front_cam`, `wrist_cam`, `action`, `eef_pos`, and `eef_quat`. The adapter
+validates synchronized episode lengths and converts the collector's shifted
+action convention to JEPA-WM's current-state-to-next-state convention.
+
 Set these environment variables in your `~/.bashrc` or `~/.zshrc`:
 
 ```bash

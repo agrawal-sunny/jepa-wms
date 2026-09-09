@@ -1,0 +1,239 @@
+app: vjepa_wm
+nodes: 1
+tasks_per_node: 1
+cpus_per_task: 8
+folder: ${JEPAWM_LOGS}/lift_env_ur/step2_lpips_lift_env_ur_dinovits_224
+checkpoint_folder: ${JEPAWM_CKPT}/lift_env_ur/step2_lpips_lift_env_ur_dinovits_224
+
+# Step-2, in-domain decoder head: finetunes the public cross-environment
+# VM2M image decoder (see configs/vjepa_wm/vm2m/open_source_decs/) on
+# UR lift_env frames only, so wm training/eval visualizations for this
+# env look like the actual scene instead of the generic VM2M reconstruction.
+# Mirrors configs/vjepa_wm/isaac_lift_env_ur.yaml's data section (same
+# dataset, same img_size/camera_views) with the vm2m step2 configs'
+# decoder-only optimization block (main_optimizer: image_head).
+data:
+  dataset_type: isaac_npz
+  # This recursive alias includes random/, success/, and failure/.
+  datasets: [IsaacLiftEnvUR]
+  datasets_weights: null
+  seed: 234
+  img_size: 224
+  validation:
+    val_demo_types: [success, failure]
+    val_datasets: []
+    val_datasets_1: null
+    num_frames_val: 1
+    val_dataset_batch_size: 8
+    val_dataset_drop_last: false
+    val_dataset_fpcs: [1]
+    val_dataset_camera_views: [front_cam, wrist_cam]
+    val_viz_rank0_loader: false
+  loader:
+    # No predictor/rollout to keep in memory here (frozen encoder, single
+    # decoder head only), so this can run a larger batch than the paired WM
+    # training config (isaac_lift_env_ur.yaml, batch_size: 2). Still
+    # shares the GPU with that (and the ur) run though, and the depth-24
+    # decoder folds front_cam+wrist_cam into the batch (2x), so kept modest
+    # -- bump this if you have the card to yourself.
+    batch_size: 8
+    num_workers: 4
+    pin_mem: true
+    persistent_workers: true
+    drop_last: true
+  custom:
+    split_ratio: 0.9
+    frameskip: 1
+    action_skip: 1
+    state_skip: 1
+    normalize_action: false
+    traj_subset: true
+    filter_first_episodes: null
+    filter_tasks: null
+    # Image reconstruction is a per-frame task -- no history/rollout needed
+    # here (unlike the WM predictor configs), so each clip is a single frame.
+    # Keeps the depth-24 decoder + LPIPS(VGG) forward pass affordable and
+    # maximizes distinct frames seen per epoch for a fixed batch_size.
+    num_hist: 1
+    num_pred: 0
+    with_reward: false
+    process_actions: concat
+    dset_fraction: 1.0
+  camera:
+    camera_frame: false
+    camera_views: [front_cam, wrist_cam]
+    droid_to_rcasa_action_format: false
+    rcasa_to_droid_action_format: false
+    fps: 20
+    dataset_fpcs: [4]
+    mpk_manifest_patterns: []
+
+data_aug:
+  auto_augment: false
+  random_horizontal_flip: false
+  motion_shift: false
+  random_resize_aspect_ratio: [1.0, 1.0]
+  random_resize_scale: [1.0, 1.0]
+  reprob: 0.0
+  normalize: [[0.5, 0.5, 0.5], [0.5, 0.5, 0.5]]
+
+logging:
+  write_tag: jepa
+  latest_format: pth.tar
+  wandb:
+    use_wandb: true
+    debug: false
+    project: jepa-wm-lift-ur-decoder
+    disable_wandb_media: false
+    log_media_locally: false
+
+loss:
+  cos_loss_weight: 0.0
+  l1_loss_weight: 0.0
+  l2_loss_weight: 1.0
+  smooth_l1_loss_weight: 0.0
+
+meta:
+  plan_only_eval_mode: false
+  light_eval_only_mode: false
+  quick_debug: false
+  freeze_encoder: true
+  load_checkpoint: true
+  load_opt_scale_epoch: true
+  read_checkpoint: null
+  pretrained_path: null
+  seed: 234
+  eval_freq: 5
+  # Was 500 == iterations_per_epoch, so eval only ever fired once per epoch
+  # (right at the last iter) -- too sparse to tell real convergence from a
+  # single noisy point. With epochs this short (500 iters), 25 gives 20 eval
+  # points/epoch (100 over the full 5-epoch/2500-iter run) -- one extra
+  # (backward-free) forward pass every 25 train iters is cheap next to that.
+  light_eval_freq: 25
+  save_every_freq: 10
+  dtype: bfloat16
+  data_traj_rollout_eval:
+    # No predictor is trained/loaded in this run (main_optimizer: image_head,
+    # predictor.pred_type: none below), so there is nothing to roll out.
+    do_data_traj_rollout_eval: false
+  energy_landscape_eval:
+    do_energy_landscape_eval: false
+
+model:
+  grid_size: 16
+  tubelet_size_enc: 1
+  use_activation_checkpointing: false
+  # No predictor is built in this run -- see predictor.pred_type below.
+  action_conditioning: none
+  proprio_encoding: none
+  num_frames_pred: 1
+  visual_encoder:
+    enc_type: dino
+    enc_version: dinov2_vits14
+    pretrain_enc_path: null
+    pretrain_enc_ckpt_key: target_encoder
+    embed_dim: 384
+    enc_use_rope: null
+    enc_name: null
+    use_sdpa_enc: true
+    num_frames_enc: 16
+    uniform_power: true
+  action_encoder:
+    action_tokens: 0
+    action_emb_dim: 0
+    act_mlp: false
+    action_encoder_inpred: true
+  proprio_encoder:
+    proprio_tokens: 0
+    proprio_emb_dim: 0
+    prop_mlp: false
+    proprio_encoder_inpred: false
+  predictor:
+    tubelet_size: 1
+    pred_num_heads: 16
+    pred_depth: 6
+    pred_embed_dim: 384
+    pred_type: none
+  wm_encoding:
+    batchify_video: true
+    dup_image: false
+    normalize_reps: false
+  rollout_cfg:
+    rollout_steps: 1
+    train_rollout_prefixes: random
+    rollout_stop_gradient: true
+    sampling_scheduler:
+      type: linear
+      start: 0.0
+      end: 0.0
+  attn:
+    local_window_time: 3
+    local_window_h: -1
+    local_window_w: -1
+  # patch_size/embed_dim/decoder depth match the public VM2M checkpoint
+  # (dinov2_vits_224_INet pairing) that this run finetunes from -- keep
+  # these in sync with configs/vjepa_wm/isaac_lift_env_ur.yaml's
+  # heads_cfg so the finetuned checkpoint stays a drop-in replacement there.
+  # num_views stays 1: WorldModelViTImageHead.decode() folds the two camera
+  # views into the batch and decodes each one separately (app/plan_common/
+  # models/wm_heads.py), so the head itself only ever sees one view at a time.
+  heads_cfg:
+    architectures:
+      image_head:
+        kind: vit
+        config:
+          patch_size: 8
+          in_chans: 3
+          img_size: [224, 224]
+          embed_dim: 384
+          decoder_embed_dim: 1024
+          depth: 24
+          num_heads: 16
+          mlp_ratio: 4.0
+          num_views: 1
+          # On to trade compute for memory (see loader.batch_size note above).
+          use_activation_checkpointing: true
+          use_lpips: true
+          pixelloss_weight: 10
+          perceptual_weight: 1
+    # Finetune from the public cross-environment decoder rather than
+    # training from scratch -- it already reconstructs DINOv2-S/14 patch
+    # features into 224x224 RGB well; here it only needs to adapt to the
+    # lift_env-franka scene distribution (table/robot/cube colors, lighting).
+    pretrain_dec_path:
+      image_head: https://dl.fbaipublicfiles.com/jepa-wms/vm2m_lpips_dv2vits_vitldec_224_INet.pth.tar
+    # The public checkpoint is the image-head file itself, not a JEPA checkpoint base path.
+    new_path_heads:
+      image_head: false
+
+optimization:
+  main_optimizer: image_head
+  train_heads: true
+  heads:
+    train_predictor: false
+    train_heads_on_predictor: false
+    image_head:
+      use_radamw: false
+      betas: [0.9, 0.99]
+      eps: 1e-8
+      ipe_scale: 1.25
+      weight_decay: 0.1
+      final_weight_decay: 0.1
+      # Small finetune LR (10x below vm2m's from-scratch ref_lr: 5e-4) since
+      # this starts from a converged checkpoint on in-domain data only.
+      final_lr: 1.0e-6
+      start_lr: 0.0
+      ref_lr: 5.0e-5
+      warmup: 1
+      # Matches configs/vjepa_wm/lift_env_franka/step2_lpips_lift_env_franka_dinovits_224.yaml's
+      # fix: iterations_per_epoch was null (-> dataset_size / batch_size) on
+      # top of num_epochs: 30. Pinned so iterations_per_epoch * num_epochs ==
+      # 5000, matching DINO-WM's train_dino_decoder.py train_iter and the
+      # franka decoder run, for a comparable ~2-hour budget.
+      num_epochs: 5
+      iterations_per_epoch: 500
+      clip_grad: 1
+      mixed_precision: true
+
+evals:
+  eval_cfg_paths: null

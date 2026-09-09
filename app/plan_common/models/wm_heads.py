@@ -102,8 +102,26 @@ class WorldModelViTImageHead(TrainableModel):
         return {"loss": loss.mean()}
 
     def decode(self, features):
+        """features: b t v h w d.
+
+        The decoder's own view_tokens parameter is sized for exactly
+        self.unwrapped.num_views (fixed at construction, so a pretrained
+        checkpoint's view_tokens shape can't be changed to match a different
+        view count without reinitializing it untrained). When the caller
+        passes more views than the decoder was built for -- e.g. a num_views=1
+        pretrained checkpoint used to visualize our multiview (front+wrist)
+        rollouts -- fold views into the batch and decode each one separately
+        through the same pretrained decoder, then restore the view axis.
+        """
+        b, t, v, h, w, d = features.shape
+        fold_views = v > 1 and self.unwrapped.num_views == 1
+        if fold_views:
+            features = rearrange(features, "b t v h w d -> (b v) t 1 h w d")
         predicted_pixels = self.model(features)
-        return self.postprocess_rgb(predicted_pixels)
+        predicted_pixels = self.postprocess_rgb(predicted_pixels)
+        if fold_views:
+            predicted_pixels = rearrange(predicted_pixels, "(b v) t 1 h w c -> b t v h w c", b=b, v=v)
+        return predicted_pixels
 
     def preprocess_rgb(self, rgb_target):
         rgb_target = rearrange(

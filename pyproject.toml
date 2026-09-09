@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "JEPA-WMs"
 version = "1.0.0"
 readme = "README.md"
-requires-python = ">=3.10,<3.11"
+requires-python = ">=3.10,<3.12"
 authors = [
     {name = "Fundamental AI Research"}
 ]
@@ -20,13 +20,14 @@ dependencies = [
     "tensordict>=0.9.1",
     "timm>=1.0.19",
     # Data processing
-    "numpy",
+    # Isaac Lab/Isaac Sim extensions still rely on the NumPy 1.x ABI.
+    "numpy>=1.26,<2",
     "pandas",
     "h5py",
     "einops",
     "datasets",  # HuggingFace datasets for loading parquet/arrow data
     # Image and video processing
-    "opencv-python",
+    "opencv-python<5",
     "pillow",
     "decord>=0.6.0",
     "imageio",
@@ -63,7 +64,9 @@ dependencies = [
     "shapely",
     "pybullet",
     "mujoco>=3.2.0",
-    "dm-control>=1.0.34",
+    # MetaWorld 3.1.1 pins mujoco==3.3.0; newer dm-control releases require
+    # a newer MuJoCo and make the environment impossible to resolve.
+    "dm-control==1.0.28",
     "metaworld",
     # PointMaze environment (requires both mujoco and mujoco-py)
     "d4rl",
@@ -83,7 +86,7 @@ dev = [
 ]
 
 [tool.uv.sources]
-metaworld = { git = "https://github.com/Farama-Foundation/Metaworld.git", branch = "master" }
+metaworld = { git = "https://github.com/Farama-Foundation/Metaworld.git", branch = "main" }
 d4rl = { git = "git+https://github.com/Farama-Foundation/D4RL.git", branch = "master" }
 
 # NOTE: robocasa and robosuite must be installed manually from source.

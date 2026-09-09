@@ -6,6 +6,7 @@
 #
 
 import os
+import re
 
 # -- FOR DISTRIBUTED TRAINING ENSURE ONLY 1 DEVICE VISIBLE PER PROCESS
 try:
@@ -28,6 +29,7 @@ import torch
 import torch.multiprocessing as mp
 import wandb
 from einops import rearrange
+from PIL import Image, ImageDraw
 from torch.nn.parallel import DistributedDataParallel as DDP
 from tqdm import tqdm
 
@@ -39,6 +41,7 @@ from app.plan_common.models.wm_heads import (
     WorldModelRewardReadoutHead,
     WorldModelViTImageHead,
 )
+from app.vjepa_wm.metric_names import scalar_metrics
 from app.vjepa_wm.utils import (
     build_plan_eval_args,
     build_unroll_decode_eval_args,
@@ -69,6 +72,51 @@ torch.backends.cudnn.benchmark = True
 
 
 logger = get_logger(__name__)
+
+
+def _readable_name(value):
+    """Turn config identifiers such as IsaacLiftEnvUR into stable log names."""
+    value = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", str(value))
+    return re.sub(r"[^a-zA-Z0-9]+", "_", value).strip("_").lower()
+
+
+def fold_views_for_image_head(image_head, video_features, visual):
+    """Fold a multiview camera axis into the batch for WorldModelViTImageHead.
+
+    The head's own view_tokens parameter is sized for exactly
+    image_head.unwrapped.num_views (fixed at construction), so a decoder
+    built/pretrained with num_views=1 can't consume a real view axis (e.g. a
+    front_cam + wrist_cam clip encoded as b t v h w d). Mirrors
+    WorldModelViTImageHead.decode()'s existing "(b v) t 1 ..." convention for
+    that same mismatch, applied here to both the encoder features and the
+    raw rgb target so image_head training/eval (compute_loss) can also run
+    on multiview datasets, not just single-camera ones.
+    """
+    num_views = getattr(image_head.unwrapped, "num_views", 1)
+    if video_features.ndim != 6 or video_features.shape[2] <= 1 or num_views != 1:
+        return video_features, visual
+    video_features = rearrange(video_features, "b t v h w d -> (b v) t 1 h w d")
+    visual = rearrange(visual, "b t v c h w -> (b v) t c h w")
+    return video_features, visual
+
+
+def _label_comparison(array, first_label, second_label, split_axis):
+    """Burn comparison labels into an HWC image or TCHW video."""
+    is_video = array.ndim == 4
+    frames = array.transpose(0, 2, 3, 1) if is_video else array[None]
+    labeled = []
+    for frame in frames:
+        image = Image.fromarray(frame)
+        draw = ImageDraw.Draw(image)
+        split = image.width // 2 if split_axis == "width" else image.height // 2
+        positions = [(4, 4), (split + 4, 4)] if split_axis == "width" else [(4, 4), (4, split + 4)]
+        for position, label in zip(positions, (first_label, second_label)):
+            bbox = draw.textbbox(position, label)
+            draw.rectangle((bbox[0] - 3, bbox[1] - 2, bbox[2] + 3, bbox[3] + 2), fill="black")
+            draw.text(position, label, fill="white")
+        labeled.append(np.asarray(image))
+    result = np.stack(labeled)
+    return result.transpose(0, 3, 1, 2) if is_video else result[0]
 
 
 def main(args, resume_preempt=False):
@@ -149,7 +197,7 @@ def main(args, resume_preempt=False):
     proprio_tokens = cfgs_model.get("proprio_encoder", {}).get("proprio_tokens", 1)
     action_emb_dim = cfgs_model.get("action_encoder", {}).get("action_emb_dim", 0)
     proprio_emb_dim = cfgs_model.get("proprio_encoder", {}).get("proprio_emb_dim", 0)
-    use_proprio = proprio_tokens > 0 or proprio_emb_dim > 0
+    use_proprio = cfgs_model.get("use_proprio", proprio_tokens > 0 or proprio_emb_dim > 0)
     use_action = action_tokens > 0 or action_emb_dim > 0
     tubelet_size_enc = cfgs_model.get("tubelet_size_enc", 2)
 
@@ -163,7 +211,24 @@ def main(args, resume_preempt=False):
     cfgs_validation = cfgs_data.get("validation", {})
     cfgs_loader = cfgs_data.get("loader", {})
     cfgs_custom = cfgs_data.get("custom", {})
-    cfgs_droid = cfgs_data.get("droid", {})
+    # "camera" is the generic name for this block (camera_views, fps, etc.) --
+    # historically named "droid" repo-wide even for non-DROID datasets (isaac_npz
+    # lift_env included), which reads as if it only applies to DROID data. Configs
+    # not yet renamed still work via the "droid" fallback.
+    cfgs_camera = cfgs_data.get("camera", cfgs_data.get("droid", {}))
+    # Predictor attention (causal mask sizing, RoPE) is built once at model
+    # construction time, so the view count has to be static per run: it must
+    # match len(camera_views) exactly, for both the train and validation
+    # dataset (val_dataset_camera_views), since both share one model.
+    _camera_views = cfgs_camera.get("camera_views", ["front_cam"])
+    num_views = len(_camera_views) if isinstance(_camera_views, (list, tuple)) else 1
+    _val_camera_views = cfgs_validation.get("val_dataset_camera_views", _camera_views)
+    if isinstance(_val_camera_views, (list, tuple)) and len(_val_camera_views) != num_views:
+        raise ValueError(
+            f"camera_views has {num_views} view(s) but val_dataset_camera_views has "
+            f"{len(_val_camera_views)}; the predictor's attention is built for a fixed "
+            "view count shared by train and validation."
+        )
 
     # Compute dataset paths
     datasets = cfgs_data.get("datasets", [])
@@ -180,11 +245,18 @@ def main(args, resume_preempt=False):
     val_datasets = cfgs_validation.get("val_datasets", [])
     val_dataset_paths = get_dataset_paths(val_datasets) if val_datasets else None
 
-    # val_datasets_1 subconfig (for second validation set)
-    val_datasets_1 = cfgs_validation.get("val_datasets_1", None)
-    val_datasets_1_paths = None
-    if val_datasets_1 is not None:
-        val_datasets_1_paths = get_dataset_paths(val_datasets_1.get("names"))
+    # val_datasets_1..4 subconfigs: extra eval/viz loaders beyond the primary
+    # combined one, e.g. embodiment-pure validation loaders or (with
+    # split: train) a demo-type-filtered slice of the actual training data.
+    # Each can override image_head_key so its rollout decodes/scores through
+    # a different heads[] decoder than the default "image_head" (see
+    # val_loader_head_keys below). val_datasets_1 alone is the long-standing
+    # slot other configs already set (usually to null); _2/_3/_4 are new.
+    extra_val_slots = {}
+    for slot_num in (1, 2, 3, 4):
+        slot_cfg = cfgs_validation.get(f"val_datasets_{slot_num}", None)
+        if slot_cfg is not None:
+            extra_val_slots[slot_num] = (slot_cfg, get_dataset_paths(slot_cfg.get("names")))
 
     # Fields used outside init_data
     frameskip = cfgs_custom.get("frameskip", True)
@@ -266,8 +338,16 @@ def main(args, resume_preempt=False):
         logger.info("♻️  Resuming from checkpoint")
     load_path = None
     if load_model:
-        if resume_finetune:
-            load_path = os.path.join(folder, r_file) if r_file is not None else latest_path
+        if r_file is not None:
+            # An explicit checkpoint was requested (meta.read_checkpoint, e.g.
+            # via --resume-run --resume-checkpoint) -- honor it regardless of
+            # finetune/"-latest" state, so resuming isn't limited to whichever
+            # file happens to be named "-latest".
+            load_path = r_file if os.path.isabs(r_file) else os.path.join(folder, r_file)
+            load_opt_scale_epoch = not head_training_mode
+            logger.info(f"♻️  Resuming from explicit checkpoint: {load_path}")
+        elif resume_finetune:
+            load_path = latest_path
             load_opt_scale_epoch = not head_training_mode
         elif resume_latest:
             load_path = latest_path
@@ -303,6 +383,21 @@ def main(args, resume_preempt=False):
         if train:
             global train_csv_logger_columns
             train_csv_logger_columns = ["epoch", "itr", "loss", "gpu-time(ms)", "iter-time(ms)"] + sorted_keys
+            # Header must declare the same 5 leading columns log_stats() actually
+            # writes (epoch, itr, loss, gpu-time(ms), iter-time(ms)) -- previously
+            # only epoch/itr were declared here, so CSVLogger.log()'s zip(types,
+            # data) silently truncated to the shorter list, shifting every logged
+            # value 3 columns left of its true header name and dropping the last
+            # 3 sorted_keys entirely.
+            return CSVLogger(
+                csv_log_file,
+                ("%d", "epoch"),
+                ("%d", "itr"),
+                ("%.5f", "loss"),
+                ("%.5f", "gpu-time(ms)"),
+                ("%.5f", "iter-time(ms)"),
+                *new_columns,
+            )
         else:
             global eval_csv_logger_columns
             eval_csv_logger_columns = ["epoch", "itr"] + sorted_keys
@@ -331,7 +426,7 @@ def main(args, resume_preempt=False):
     data_kwargs.update(cfgs_validation)
     data_kwargs.update(cfgs_loader)
     data_kwargs.update(cfgs_custom)
-    data_kwargs.update(cfgs_droid)
+    data_kwargs.update(cfgs_camera)
     # Add computed/override parameters
     data_kwargs.update(
         {
@@ -347,6 +442,14 @@ def main(args, resume_preempt=False):
     )
 
     val_data_iters = []
+    primary_val_names = val_datasets or cfgs_data.get("datasets", [])
+    val_loader_names = [_readable_name("_".join(primary_val_names)) or "validation"]
+    # Parallel to val_loader_names: which heads[] image decoder each loader's
+    # eval/rollout should decode through. Defaults to "image_head" everywhere
+    # (old behavior); val_datasets_1/_2 can override via image_head_key so an
+    # embodiment-pure loader uses that embodiment's own finetuned decoder
+    # instead of the one global default (see step_model's head_key param).
+    val_loader_head_keys = ["image_head"]
     (
         dataset,
         val_dataset,
@@ -359,29 +462,61 @@ def main(args, resume_preempt=False):
     ) = init_data(**data_kwargs)
     val_data_iters.append((val_dataset, val_traj_dataset, val_unsupervised_loader))
 
-    if val_datasets_1:
-        # Reuse data_kwargs and override val_datasets_1-specific fields
-        data_kwargs_1 = data_kwargs.copy()
-        data_kwargs_1.update(
+    # val_datasets_1..4: each makes its own init_data call over its own
+    # data_paths (so it gets its own internal train/valid split, independent
+    # of the primary loader's). split: "valid" (default) uses that call's
+    # held-out slice, as before; split: "train" uses its *train* slice
+    # instead -- e.g. to visualize the actual training distribution
+    # restricted to success/failure via filter_train_by_demo_types, rather
+    # than a held-out set. Either way the result is just one more entry in
+    # val_data_iters/val_loader_names/val_loader_head_keys; step_model
+    # doesn't distinguish "train-sourced" loaders from real validation ones.
+    for slot_num, (slot_cfg, slot_paths) in sorted(extra_val_slots.items()):
+        split = slot_cfg.get("split", "valid")
+        if split not in ("train", "valid"):
+            raise ValueError(f"val_datasets_{slot_num}.split must be 'train' or 'valid', got {split!r}")
+        data_kwargs_slot = data_kwargs.copy()
+        data_kwargs_slot.update(
             {
                 "dset_fraction": 1,
                 "val_dset_fraction": 1,
-                "data_paths": val_datasets_1_paths,
-                "val_data_paths": val_datasets_1_paths,
-                "batch_size": val_datasets_1.get("batch_size", 4),
-                "drop_last": val_datasets_1.get("drop_last", True),
-                "fps": val_datasets_1.get("fps", 4),
-                "dataset_fpcs": val_datasets_1.get("fpcs", [8]),
-                "val_dataset_fpcs": val_datasets_1.get("fpcs", [8]),
-                "camera_views": val_datasets_1.get("camera_views", ["exterior_image_2_left"]),
-                "droid_to_rcasa_action_format": val_datasets_1.get("droid_to_rcasa_action_format", 1),
+                "data_paths": slot_paths,
+                "val_data_paths": slot_paths,
+                "batch_size": slot_cfg.get("batch_size", 4),
+                "drop_last": slot_cfg.get("drop_last", True),
+                "fps": slot_cfg.get("fps", 4),
+                "dataset_fpcs": slot_cfg.get("fpcs", [8]),
+                "val_dataset_fpcs": slot_cfg.get("fpcs", [8]),
+                "camera_views": slot_cfg.get("camera_views", ["exterior_image_2_left"]),
+                "droid_to_rcasa_action_format": slot_cfg.get("droid_to_rcasa_action_format", 1),
+                "filter_train_by_demo_types": split == "train",
             }
         )
-        _, val_dataset_1, _, val_traj_dataset_1, _, val_unsupervised_loader_1, _, viz_val_data_loader = init_data(
-            **data_kwargs_1
-        )
-        val_data_iters.append((val_dataset_1, val_traj_dataset_1, val_unsupervised_loader_1))
-    if dataset_type == "custom" and traj_dataset is not None:
+        (
+            slot_train_dataset,
+            slot_val_dataset,
+            slot_train_traj_dataset,
+            slot_val_traj_dataset,
+            slot_train_loader,
+            slot_val_loader,
+            _,
+            slot_viz_val_loader,
+        ) = init_data(**data_kwargs_slot)
+        if split == "train":
+            val_data_iters.append((slot_train_dataset, slot_train_traj_dataset, slot_train_loader))
+        else:
+            val_data_iters.append((slot_val_dataset, slot_val_traj_dataset, slot_val_loader))
+            if slot_num == 1:
+                # Preserve old behavior: val_datasets_1 alone used to also
+                # replace the rank0 viz loader. Later slots don't touch it.
+                viz_val_data_loader = slot_viz_val_loader
+        name_suffix = "_train" if split == "train" else ""
+        default_name = f"validation_{slot_num + 1}{name_suffix}"
+        slot_name = _readable_name("_".join(slot_cfg.get("names", [])))
+        val_loader_names.append(f"{slot_name}{name_suffix}" if slot_name else default_name)
+        val_loader_head_keys.append(slot_cfg.get("image_head_key", "image_head"))
+
+    if dataset_type in ("custom", "isaac_npz") and traj_dataset is not None:
         preprocessor = Preprocessor(
             action_mean=traj_dataset.action_mean,
             action_std=traj_dataset.action_std,
@@ -426,41 +561,44 @@ def main(args, resume_preempt=False):
                 if os.path.exists(wandb_run_id_file):
                     with open(wandb_run_id_file, "r") as f:
                         wandb_run_id = f.read().strip()
-                    wandb.init(project=project_name, id=wandb_run_id, resume="allow", dir=folder)
+                    wandb.init(project=project_name, id=wandb_run_id, resume="allow", dir=folder, config=args)
                     logger.info(f"Resuming Wandb run {wandb_run_id}")
                 else:
-                    wandb.init(project=project_name, dir=folder)
+                    wandb.init(project=project_name, dir=folder, config=args)
                     with open(wandb_run_id_file, "w") as f:
                         f.write(wandb.run.id)
-                wandb.run.name = os.path.basename(folder)
+                wandb.run.name = config.get("run_name", os.path.basename(folder))
                 self.job_set = set()
+                # Also upload the exact resolved config file (dumped by app/main.py) so
+                # the run's Files tab carries the literal yaml alongside the searchable
+                # config panel populated above.
+                params_path = os.path.join(folder, "params-pretrain.yaml")
+                if os.path.exists(params_path):
+                    wandb.save(params_path, policy="now")
+                else:
+                    logger.warning(f"Expected config file not found, skipping wandb upload: {params_path}")
 
         def log(self, epoch, itr, losses, total_stats, eval_losses=None, eval_total_stats=None, image_stats=None):
             log_dict = {
                 "epoch": epoch + 1,
                 "itr": itr,
             }
-            for key, value in losses.items():
-                if isinstance(value, torch.Tensor):
-                    value = value.detach().cpu().item()
-                log_dict[key] = value
-            for key, value in total_stats.items():
-                log_dict[key] = value
-            if eval_losses is not None:
-                for key, value in eval_losses.items():
+            train_metrics = {**losses, **total_stats}
+            eval_metrics = {**(eval_losses or {}), **(eval_total_stats or {})}
+            for split, metrics in (("train", train_metrics), ("eval", eval_metrics)):
+                named = scalar_metrics(metrics, split, cfgs_loss)
+                for key, value in named.items():
                     if isinstance(value, torch.Tensor):
                         value = value.detach().cpu().item()
-                    log_dict[key] = value
-            if eval_total_stats is not None:
-                for key, value in eval_total_stats.items():
                     log_dict[key] = value
             if image_stats:  # not None or nonempty
                 if self.log_media_locally and rank == 0:
                     self.log_media_local(image_stats, epoch, itr)
                 if not self.disable_wandb_media:
                     log_dict.update(image_stats)
-            if "loss" in log_dict.keys() and itr % log_freq == 0:
-                logger.info("[%d, %5d] " "loss: %.3f | " % (epoch + 1, itr, log_dict["loss"]))
+            # Console output is a single per-epoch tqdm progress bar (see the
+            # training loop) instead of a "[epoch, itr] loss: ..." line per
+            # log_freq iters; wandb/CSV logging below is unaffected.
             if self.use_wandb and rank == 0:
                 wandb.log(log_dict)
 
@@ -523,22 +661,38 @@ def main(args, resume_preempt=False):
             "cfgs_attn_pattern": cfgs_model.get("attn", None),  # Pass attn subconfig
             "use_proprio": use_proprio,  # Computed derived value
             "use_action": use_action,  # Computed derived value
+            "num_views": num_views,  # Computed from data.droid.camera_views
         }
     )
     predictor, encoder, action_encoder, proprio_encoder = init_video_model(**model_kwargs)
+    if predictor is not None and hasattr(predictor, "action_encoder_output_dim"):
+        action_dimensions = {
+            "action_dim": model_action_dim,
+            "action_encoder_output_dim": predictor.action_encoder_output_dim,
+            "adaln_conditioning_dim": predictor.predictor_total_embed_dim,
+            "use_proprio": use_proprio,
+        }
+        logger.info(f"Action conditioning dimensions: {action_dimensions}")
+        if rank == 0 and wandb.run is not None:
+            wandb.run.summary.update(action_dimensions)
 
     heads = {}
     if train_heads or pretrain_dec_path is not None:
-        if "image_head" in heads_architectures:
-            image_head_type = heads_architectures["image_head"]["kind"]
+        # "image_head" plus any "image_head_<suffix>" entries (e.g. per-embodiment
+        # decoders such as "image_head_ur") -- all built the same way, each kept
+        # under its own heads[] key so eval can pick the right one per batch.
+        for head_name in heads_architectures:
+            if head_name != "image_head" and not head_name.startswith("image_head_"):
+                continue
+            image_head_type = heads_architectures[head_name]["kind"]
             if image_head_type is not None and image_head_type.lower() != "none":
                 if image_head_type == "vit":
                     decoder = WorldModelViTImageHead(
-                        head_config=dict(heads_architectures["image_head"]["config"]),
+                        head_config=dict(heads_architectures[head_name]["config"]),
                         inverse_transform=inverse_transform,
                         device=device,
                     )
-                heads["image_head"] = decoder
+                heads[head_name] = decoder
         if "state_head" in heads_architectures:
             state_decoder = WorldModelPoseReadoutHead(
                 head_config=dict(heads_architectures["state_head"]["config"]), device=device
@@ -586,13 +740,22 @@ def main(args, resume_preempt=False):
         optimizer, scaler, scheduler, wd_scheduler, clip_grad, use_radamw = None, None, None, None, None, None
     if train_heads:
         for name, head in heads.items():
-            head.init_opt(**dict(cfgs_opt["heads"][name]))
+            head_opt_cfg = dict(cfgs_opt["heads"][name])
+            # Joint transition/head runs inherit the actual loader length.
+            if head_opt_cfg.get("iterations_per_epoch") is None:
+                head_opt_cfg["iterations_per_epoch"] = ipe
+            head.init_opt(**head_opt_cfg)
 
     start_epoch = 0
+    resumed_heads = False
     # -- load training checkpoint
     if load_model:
         # to resume predictor or head training
-        load_heads = heads and not pretrain_dec_path and resume
+        expected_head_paths = [
+            load_path.removesuffix(".pth.tar") + f"_{name}.pth.tar" for name in heads
+        ]
+        load_heads = bool(heads) and resume and all(os.path.exists(path) for path in expected_head_paths)
+        resumed_heads = load_heads
         logger.info(f"Load heads: {load_heads}")
         (
             predictor,
@@ -625,19 +788,28 @@ def main(args, resume_preempt=False):
             start_epoch -= 1
 
     # Load pretrained heads from pretrain_dec_path
-    if pretrain_dec_path is not None:
+    if pretrain_dec_path is not None and not resumed_heads:
         for name, head in heads.items():
             if new_path_heads.get(name, True):
                 head_path = pretrain_dec_path[name].removesuffix(".pth.tar") + "_" + name + ".pth.tar"
                 head.load_checkpoint(head_path)
                 logger.info(f"loaded pretrained head named {name}")
             else:
-                checkpoint = torch.load(pretrain_dec_path[name], map_location=torch.device("cpu"))
-                epoch = checkpoint["epoch"]
-                pretrained_dict = clean_state_dict(checkpoint[name])
-                msg = head.model.load_state_dict(pretrained_dict, strict=False)
-                logger.info(f"loaded pretrained head named {name} from epoch {epoch} with msg: {msg}")
-                del checkpoint
+                head_path = pretrain_dec_path[name]
+                if isinstance(head_path, str) and head_path.startswith(("http://", "https://")):
+                    epoch = head.load_checkpoint(head_path, load_optimizer=False)
+                    logger.info(f"loaded pretrained head named {name} from epoch {epoch}")
+                else:
+                    checkpoint = torch.load(head_path, map_location=torch.device("cpu"))
+                    if "model" in checkpoint:
+                        epoch = head.load_checkpoint(head_path, load_optimizer=False)
+                        logger.info(f"loaded pretrained head named {name} from epoch {epoch}")
+                    else:
+                        epoch = checkpoint["epoch"]
+                        pretrained_dict = clean_state_dict(checkpoint[name])
+                        msg = head.model.load_state_dict(pretrained_dict, strict=False)
+                        logger.info(f"loaded pretrained head named {name} from epoch {epoch} with msg: {msg}")
+                    del checkpoint
 
     # DDP wrapping after loading state_dicts
     if not freeze_encoder:
@@ -667,6 +839,7 @@ def main(args, resume_preempt=False):
         # From cfgs_model (pass directly from config)
         "action_tokens": action_tokens,
         "proprio_tokens": proprio_tokens,
+        "num_views": num_views,  # Computed from data.droid.camera_views
         "grid_size": cfgs_model.get("grid_size", 14),
         "tubelet_size_enc": cfgs_model.get("tubelet_size_enc", 2),
         "action_conditioning": cfgs_model.get("action_conditioning", "token"),
@@ -675,6 +848,10 @@ def main(args, resume_preempt=False):
         "pred_type": cfgs_model["predictor"].get("pred_type", "dino_wm"),
         "action_encoder_inpred": cfgs_model["action_encoder"].get("action_encoder_inpred", False),
         "proprio_encoder_inpred": cfgs_model["proprio_encoder"].get("proprio_encoder_inpred", False),
+        # Previously only reached AdaLN (which reads it directly in its own
+        # config path); apply it uniformly here so DINO-WM and other
+        # pred_types also normalize action conditioning when configured to.
+        "normalize_action_conditioning": cfgs_model.get("predictor", {}).get("normalize_action_conditioning", False),
         **cfgs_wm_encoding,
         # From cfgs_data
         "action_skip": cfgs_data.get("action_skip", 1),
@@ -740,7 +917,7 @@ def main(args, resume_preempt=False):
 
     def get_batch(train=True, idx=0):
         nonlocal train_loader, val_loader_iters
-        if dataset_type == "custom":
+        if dataset_type in ("custom", "isaac_npz"):
             try:
                 if train:
                     obs, action, state, reward = next(train_loader)
@@ -755,6 +932,10 @@ def main(args, resume_preempt=False):
                 else:
                     val_loader_iters[idx] = iter(val_data_iters[idx][2])
                     obs, action, state, reward = next(val_loader_iters[idx])
+            # Multiview batches (obs["visual"]: b t v c h w) now flow through
+            # VideoWM.encode_obs unchanged -- each view is encoded separately
+            # and concatenated into the predictor's token sequence, rather
+            # than being split into independent single-view samples here.
             for k in obs.keys():
                 obs[k] = obs[k].to(device, dtype=dtype, non_blocking=True)
             action = action.to(device, dtype=dtype, non_blocking=True)
@@ -785,7 +966,7 @@ def main(args, resume_preempt=False):
         nonlocal viz_val_loader_iter
         if rank != 0 or viz_val_loader_iter is None:
             return None, None, None, None, None, None
-        if dataset_type == "custom":
+        if dataset_type in ("custom", "isaac_npz"):
             try:
                 obs, action, state, reward = next(viz_val_loader_iter)
             except StopIteration as e:
@@ -793,6 +974,10 @@ def main(args, resume_preempt=False):
                 logger.info("Exhausted viz data loader. Refreshing...")
                 viz_val_loader_iter = iter(viz_val_data_loader)
                 obs, action, state, reward = next(viz_val_loader_iter)
+            # Multiview batches (obs["visual"]: b t v c h w) now flow through
+            # VideoWM.encode_obs unchanged -- each view is encoded separately
+            # and concatenated into the predictor's token sequence, rather
+            # than being split into independent single-view samples here.
             for k in obs.keys():
                 obs[k] = obs[k].to(device, dtype=torch.float32, non_blocking=True)
             action = action.to(device, dtype=torch.float32, non_blocking=True)
@@ -825,13 +1010,20 @@ def main(args, resume_preempt=False):
             gpu_time_meter = AverageMeter()
             wall_time_meter = AverageMeter()
 
-            for itr in range(ipe):
+            epoch_pbar = tqdm(range(ipe), desc=f"Epoch {epoch + 1}/{num_epochs}", disable=(rank != 0))
+            for itr in epoch_pbar:
                 itr_start_time = time.time()
                 if quick_debug or light_eval_only_mode:
                     if itr > 5:
                         break
 
-                def step_model(obs, action, state, reward, train=True):
+                def step_model(obs, action, state, reward, train=True, head_key="image_head"):
+                    # Eval-only: which image_head entry decodes/scores this batch's rollout.
+                    # Lets embodiment-pure validation loaders (see val_loader_head_keys) use
+                    # their own finetuned decoder instead of the single default "image_head".
+                    # Falls back to "image_head" if head_key isn't a loaded head (e.g. legacy
+                    # configs with only one decoder, or train_heads is False and it never loaded).
+                    image_head_name = head_key if head_key in world_model.heads else "image_head"
                     rates = defaultdict(float)
                     if train:
                         if train_predictor:
@@ -851,6 +1043,10 @@ def main(args, resume_preempt=False):
 
                     # Step 1. Forward
                     total_stats = {}
+                    # Initialized here (rather than only at the rollout-eval section
+                    # below) so the image_head block (2) can also populate it on
+                    # eval steps -- it runs before that section.
+                    image_stats = {}
                     total_transition_loss = 0.0
                     total_head_loss = 0.0
                     if action is not None:
@@ -879,13 +1075,33 @@ def main(args, resume_preempt=False):
                                 pred_video_features,
                                 pred_proprio_features,
                                 video_features,
-                                proprio_features,
+                                # video_features comes from the frozen, shared encoder so it's
+                                # already a fixed target; proprio_features comes from the
+                                # trainable proprio encoder and must be detached here too, or
+                                # this loss can move the target instead of just the prediction
+                                # (rollout() already detaches its proprio targets, see below).
+                                proprio_features.detach() if proprio_features is not None else None,
                                 shift=1,
                             )
+                            with torch.no_grad():
+                                copy_mse = (video_features[:, 1:].float() - video_features[:, :-1].float()).square().mean()
+                                pred_mse = (pred_video_features[:, :-1].float() - video_features[:, 1:].float()).square().mean()
+                                total_stats["copy_previous_latent_mse"] = copy_mse.item()
+                                total_stats["prediction_vs_copy_mse_ratio"] = (pred_mse / copy_mse.clamp_min(1e-8)).item()
                         else:
                             pred_video_features, pred_proprio_features = None, None
                             predictor_losses = {}
-                    predictor_loss = predictor_losses.get("loss", 0.0) / (rollout_steps + 1)
+                    # Weight every prediction horizon equally: rollout_steps is the total
+                    # number of predicted horizons (1 teacher-forced step, plus
+                    # rollout_steps - 1 further rollout steps below), each of which should
+                    # get weight 1/rollout_steps. rollout() below is called with
+                    # rollout_steps - 1 and independently divides by (that + 1), so it
+                    # already lands on 1/rollout_steps per extra step -- this just makes the
+                    # teacher-forced term match instead of the old 1/(rollout_steps + 1),
+                    # which over-weighted rollout steps relative to the teacher-forced one
+                    # (and halved the teacher-forced loss even when rollout_steps == 1 and no
+                    # extra rollout ran at all).
+                    predictor_loss = predictor_losses.get("loss", 0.0) / max(rollout_steps, 1)
                     if train and train_predictor and predictor is not None:
                         total_transition_loss += predictor_loss
                     stats = defaultdict(list)
@@ -903,20 +1119,23 @@ def main(args, resume_preempt=False):
                             train_rollout_result[f"train_rollout/{k}/{j+1}"] = stats[k][j].item()
                     # 2. TRAIN HEADS ON FEATURES FROM ENCODER
                     if "image_head" in world_model.heads and train_heads:
+                        image_head = world_model.heads["image_head"]
+                        head_video_features, head_visual = fold_views_for_image_head(
+                            image_head, video_features, obs["visual"]
+                        )
                         # Encoder produces features of videos normalized by mean and std
                         # So let's keep them for target of decoder loss
-                        target_rgb_video = world_model.heads["image_head"].preprocess_rgb(
-                            obs["visual"][:, ::tubelet_size_enc]
-                        )
+                        target_rgb_video = image_head.preprocess_rgb(head_visual[:, ::tubelet_size_enc])
                         with torch.amp.autocast("cuda", dtype=dtype, enabled=mixed_precision):
-                            encoder_image_losses = world_model.heads["image_head"].compute_loss(
-                                video_features,
+                            encoder_image_losses = image_head.compute_loss(
+                                head_video_features.detach(),
                                 target_rgb_video,
                                 global_step=epoch * ipe + itr,
                             )
-                        rates["info/image_head/examples_seen"] += video_features.shape[0] * video_features.shape[1]
+                        rates["info/image_head/examples_seen"] += (
+                            head_video_features.shape[0] * head_video_features.shape[1]
+                        )
                         encoder_image_losses = {k: v.mean() for k, v in encoder_image_losses.items()}
-                        # the weight is like that because we train the head on encoder features and potentially on predictor too
                         loss = encoder_image_losses["loss"] / (train_heads_on_predictor * rollout_steps + 1)
                         if train:
                             total_head_loss += loss
@@ -925,10 +1144,31 @@ def main(args, resume_preempt=False):
                             "encoder_image_" + k: v.item() for k, v in encoder_image_losses.items()
                         }
                         total_stats.update(encoder_image_losses)
+                        # Ground-truth vs. predicted image, logged on eval steps only
+                        # (this is the standalone decoder-training config's only
+                        # visualization -- do_data_traj_rollout_eval's rollout
+                        # images don't apply here since there's no predictor).
+                        if not train and rank == 0:
+                            # fold_views_for_image_head merges "b t v ... -> (b v) t ..." with
+                            # v as the fast axis, so sample 0's views sit at merged indices
+                            # 0..num_views-1 (view 0 = front_cam, view 1 = wrist_cam, per
+                            # data.droid.camera_views) -- loop over them instead of only ever
+                            # reading merged index 0 (sample 0's front_cam, wrist_cam skipped).
+                            view_names = _camera_views if len(_camera_views) == num_views else range(num_views)
+                            with torch.no_grad():
+                                for v, view_name in enumerate(view_names):
+                                    pred_rgb = image_head.decode(head_video_features[v : v + 1, :1])[0, 0, 0]  # h w c, uint8
+                                    # inverse_transform's mean/std buffers are plain (undeviced)
+                                    # tensors -- postprocess_rgb() also .cpu()'s its input before
+                                    # calling it, for the same reason.
+                                    gt_rgb = image_head.inverse_transform(head_visual[v : v + 1, :1].cpu())[0, 0]  # c h w
+                                    gt_rgb = (255.0 * gt_rgb).clip(0.0, 255.0).to(torch.uint8).permute(1, 2, 0)
+                                    image_stats[f"eval_image/{view_name}/ground_truth"] = wandb.Image(gt_rgb.cpu().numpy())
+                                    image_stats[f"eval_image/{view_name}/predicted"] = wandb.Image(pred_rgb.cpu().numpy())
                     if "state_head" in world_model.heads and train_heads:
                         with torch.amp.autocast("cuda", dtype=dtype, enabled=mixed_precision):
                             encoder_state_losses = world_model.heads["state_head"].compute_loss(
-                                video_features, None, state[:, ::tubelet_size_enc]
+                                video_features.detach(), None, state[:, ::tubelet_size_enc]
                             )
                         rates["info/state_head/examples_seen"] += video_features.shape[0] * video_features.shape[1]
                         encoder_state_losses = {k: v.mean() for k, v in encoder_state_losses.items()}
@@ -943,7 +1183,7 @@ def main(args, resume_preempt=False):
                     if "reward_head" in world_model.heads and train_heads:
                         with torch.amp.autocast("cuda", dtype=dtype, enabled=mixed_precision):
                             encoder_reward_losses = world_model.heads["reward_head"].compute_loss(
-                                video_features, reward[:, ::tubelet_size_enc]
+                                video_features.detach(), reward[:, ::tubelet_size_enc]
                             )
                         rates["info/reward_head/examples_seen"] += video_features.shape[0] * video_features.shape[1]
                         encoder_reward_losses = {k: v.mean() for k, v in encoder_reward_losses.items()}
@@ -958,17 +1198,19 @@ def main(args, resume_preempt=False):
                     # 3. TRAIN HEADS ON FEATURES FROM PREDICTOR
                     if train_heads_on_predictor and train_heads:
                         if "image_head" in world_model.heads:
-                            target_rgb_video = world_model.heads["image_head"].preprocess_rgb(
-                                obs["visual"][:, ::tubelet_size_enc]
+                            image_head = world_model.heads["image_head"]
+                            head_pred_video_features, head_visual = fold_views_for_image_head(
+                                image_head, pred_video_features, obs["visual"]
                             )
+                            target_rgb_video = image_head.preprocess_rgb(head_visual[:, ::tubelet_size_enc])
                             with torch.amp.autocast("cuda", dtype=dtype, enabled=mixed_precision):
-                                predictor_image_losses = world_model.heads["image_head"].compute_loss(
-                                    pred_video_features[:, :-1].detach(),
+                                predictor_image_losses = image_head.compute_loss(
+                                    head_pred_video_features[:, :-1].detach(),
                                     target_rgb_video[:, 1:],
                                     global_step=epoch * ipe + itr,
                                 )
-                            rates["info/image_head/examples_seen"] += pred_video_features.shape[0] * (
-                                pred_video_features.shape[1] - 1
+                            rates["info/image_head/examples_seen"] += head_pred_video_features.shape[0] * (
+                                head_pred_video_features.shape[1] - 1
                             )
                             predictor_image_losses = {k: v.mean() for k, v in predictor_image_losses.items()}
                             if train:
@@ -1101,7 +1343,8 @@ def main(args, resume_preempt=False):
                     total_stats.update(dict(rates))
                     # 6. ONCE IN A WHILE DO LONG-ROLLOUT EVALUATION WITH DATASET ACTIONS OR RANDOM ACTIONS
                     eval_rollout_result = {}
-                    image_stats = {}
+                    # image_stats was initialized in Step 1 (so block 2's image_head
+                    # visualization survives to here) -- not reset.
                     if not train:
                         world_model.eval()
 
@@ -1119,19 +1362,38 @@ def main(args, resume_preempt=False):
                             ctxt_window=None,
                         ):
                             """
-                            gt_obs:
-                                visual: (B, T, C, H, W)
+                            gt_obs is unused here: ground-truth comparison images are decoded
+                            from video_features through image_head instead of read from
+                            gt_obs["visual"] pixels, since that may hold precomputed embeddings
+                            rather than RGB (model.visual_encoder.enc_type: precomputed). Kept as
+                            a parameter for now since callers already pass it.
                             """
                             rollout_steps = min(val_rollout_steps, video_features.shape[1] - 1)
                             with torch.amp.autocast("cuda", dtype=dtype, enabled=mixed_precision):
                                 prefixes = range(video_features.shape[1] - rollout_steps)
                                 val_rollout_result = {}
 
+                                # Ground truth, reconstructed through the image_head decoder rather
+                                # than read from gt_obs["visual"] pixels: when the world model
+                                # consumes precomputed visual tokens (model.visual_encoder.enc_type:
+                                # precomputed), obs["visual"] holds embeddings, not RGB, so there's
+                                # no raw pixel tensor to fall back to. Decoded once here (b t v h w c,
+                                # uint8) and reused below instead of once per run_rollout_and_decode
+                                # call plus again for the rgb_v comparison image -- decoding through
+                                # the depth-24 decoder isn't free.
+                                gt_image_samples = (
+                                    world_model.heads[image_head_name].decode(video_features[:, ::tubelet_size_enc])
+                                    if image_head_name in world_model.heads
+                                    else None
+                                )
+
                                 # Helper function to run rollout with different action noise levels and decode heads
                                 def run_rollout_and_decode(action_noise, rollout_prefix):
                                     """Run rollout with given action noise and decode with image/state heads."""
                                     stats = defaultdict(list)
+                                    last_prefix_t = None
                                     for t in prefixes:
+                                        last_prefix_t = t
                                         rollout_losses, _, last_vid_feats, last_prop_feats = world_model.rollout(
                                             video_features=video_features,
                                             pred_video_features=pred_video_features,
@@ -1151,24 +1413,46 @@ def main(args, resume_preempt=False):
                                             stats[k].append(rollout_losses[k])
 
                                     image_samples = None
-                                    if "image_head" in world_model.heads:
-                                        image_samples = world_model.heads["image_head"].decode(
+                                    if image_head_name in world_model.heads:
+                                        image_samples = world_model.heads[image_head_name].decode(
                                             last_vid_feats[:, -rollout_steps - 1 :]
                                         )
+                                        lpips_by_horizon = []
                                         for h in range(1, image_samples.shape[1]):
-                                            key = f"{rollout_prefix}/lpips/{h}"
-                                            if prefix_rollout_result is not None:
-                                                key = f"{prefix_rollout_result}/{key}"
-                                            v = lpips(
-                                                image_samples.squeeze(2)[:, h]
-                                                .permute(0, 3, 1, 2)
-                                                .to(world_model.device, dtype=torch.float32)
-                                                / 255.0,
-                                                gt_obs["visual"][:, h * tubelet_size_enc].to(
-                                                    world_model.device, dtype=torch.float32
-                                                ),
-                                            ).mean()
-                                            val_rollout_result[key] = v.detach().cpu().item()
+                                            # image_samples: b t v h w c. squeeze(2) only ever
+                                            # dropped a size-1 view axis; with real multiview
+                                            # (v>1) it's a no-op and permute(0,3,1,2) then sees
+                                            # 5 dims instead of 4. Fold views into batch instead,
+                                            # so this works for both single- and multi-view.
+                                            pred = rearrange(image_samples[:, h], "b v h w c -> (b v) c h w")
+                                            pred = pred.to(world_model.device, dtype=torch.float32) / 255.0
+
+                                            # image_samples only ever holds the last prefix's
+                                            # rollout tail (last_vid_feats is overwritten every
+                                            # iteration of the loop above), so its local horizon
+                                            # index h corresponds to absolute frame
+                                            # last_prefix_t + h, not frame h of the full GT
+                                            # sequence -- index gt_image_samples at that absolute
+                                            # offset instead of at h directly.
+                                            gt_frame = rearrange(
+                                                gt_image_samples[:, last_prefix_t + h], "b v h w c -> (b v) c h w"
+                                            )
+                                            gt_frame = gt_frame.to(world_model.device, dtype=torch.float32) / 255.0
+
+                                            # pred/gt_frame are already scaled to [0, 1]; lpips
+                                            # defaults to normalize=False (expects [-1, 1]), so
+                                            # without normalize=True this silently mis-scales
+                                            # the metric instead of erroring.
+                                            v = lpips(pred, gt_frame, normalize=True).mean().detach().cpu()
+                                            lpips_by_horizon.append(v)
+                                        if lpips_by_horizon:
+                                            values = torch.stack(lpips_by_horizon)
+                                            base = (
+                                                f"{prefix_rollout_result}/{rollout_prefix}"
+                                                if prefix_rollout_result
+                                                else rollout_prefix
+                                            )
+                                            val_rollout_result[f"{base}/lpips_average"] = values.mean().item()
 
                                     if "state_head" in world_model.heads:
                                         target_states = gt_state[:, ::tubelet_size_enc][:, -rollout_steps - 1 :]
@@ -1178,26 +1462,38 @@ def main(args, resume_preempt=False):
                                             target_states,
                                             reduce_mean=False,
                                         )
-                                        for k in state_loss:
-                                            for j in range(state_loss[k].shape[1]):
-                                                key = f"{rollout_prefix}/encoder_state_{k}/{j}"
-                                                if prefix_rollout_result is not None:
-                                                    key = f"{prefix_rollout_result}/{key}"
-                                                val_rollout_result[key] = state_loss[k][:, j].mean().item()
+                                        for k, values in state_loss.items():
+                                            values = values.mean(0)
+                                            base = (
+                                                f"{prefix_rollout_result}/{rollout_prefix}"
+                                                if prefix_rollout_result
+                                                else rollout_prefix
+                                            )
+                                            metric = _readable_name(f"decoded_state_{k}").removesuffix("_loss")
+                                            val_rollout_result[f"{base}/{metric}_average"] = values.mean().item()
 
                                     # Aggregate rollout losses
                                     stats = {k: torch.stack(stats[k]).mean(0) for k in stats}
-                                    for k in stats:
-                                        for j in range(len(stats[k])):
-                                            key = f"{rollout_prefix}/{k}/{j+1}"
-                                            if prefix_rollout_result is not None:
-                                                key = f"{prefix_rollout_result}/{key}"
-                                            val_rollout_result[key] = stats[k][j].item()
+                                    for k, values in stats.items():
+                                        if k != "loss" and not k.startswith("proprio_"):
+                                            weight_key = re.sub(r"^(visual|proprio)_", "", k) + "_weight"
+                                            if cfgs_loss.get(weight_key, 0.0) == 0.0:
+                                                continue
+                                        base = (
+                                            f"{prefix_rollout_result}/{rollout_prefix}"
+                                            if prefix_rollout_result
+                                            else rollout_prefix
+                                        )
+                                        metric = _readable_name(k).removesuffix("_loss")
+                                        # compute_loss has already averaged batch and feature/token
+                                        # axes. Finish by averaging rollout prefixes and horizons,
+                                        # yielding exactly one scalar for every eval metric.
+                                        val_rollout_result[f"{base}/{metric}_average"] = values.mean().item()
 
                                     return image_samples
 
                                 eval_image_samples = run_rollout_and_decode(
-                                    action_noise=0.0, rollout_prefix="val_rollout"
+                                    action_noise=0.0, rollout_prefix="dataset_actions"
                                 )
 
                                 # Optionally decode position from ground truth visual features
@@ -1206,46 +1502,47 @@ def main(args, resume_preempt=False):
                                     decode_gt_state_loss = world_model.heads["state_head"].compute_loss(
                                         video_features[:, -rollout_steps - 1 :], None, target_states, reduce_mean=False
                                     )
-                                    for k in decode_gt_state_loss:
-                                        for j in range(decode_gt_state_loss[k].shape[1]):
-                                            key = f"val_rollout/decode_gt_state_{k}/{j}"
-                                            if prefix_rollout_result is not None:
-                                                key = f"{prefix_rollout_result}/{key}"
-                                            val_rollout_result[key] = decode_gt_state_loss[k][:, j].mean().item()
+                                    for k, values in decode_gt_state_loss.items():
+                                        values = values.mean(0)
+                                        base = f"{prefix_rollout_result}/ground_truth_decode"
+                                        metric = _readable_name(k).removesuffix("_loss")
+                                        val_rollout_result[f"{base}/{metric}_average"] = values.mean().item()
 
                                 noisy_eval_image_samples = run_rollout_and_decode(
-                                    action_noise=0.05, rollout_prefix="noisy_val_rollout"
+                                    action_noise=0.05, rollout_prefix="noisy_actions"
                                 )
 
                                 if "image_head" in world_model.heads:
                                     t = eval_image_samples.shape[1]
-                                    b = gt_obs["visual"].shape[0]
-                                    # b = gt_obs["visual"][:, ::tubelet_size_enc].shape[0]
-                                    b = min(4, b)
-                                    rgb_v = inverse_transform(gt_obs["visual"][:, ::tubelet_size_enc].cpu())
-                                    rgb_v = (255.0 * rgb_v).clip(0.0, 255.0).to(torch.uint8)
-                                    rgb_v = rearrange(rgb_v, "b t (v c) h w -> b t v h w c", c=3)
-                                    rgb = torch.stack([eval_image_samples, rgb_v[:, -t:]], dim=2)[:b]
+                                    b = min(4, video_features.shape[0])
+                                    # gt_image_samples (decoded once above) is already b t v h w c,
+                                    # uint8 -- no inverse_transform/rearrange needed, unlike the raw
+                                    # gt_obs["visual"] pixels this used to read.
+                                    rgb_v = gt_image_samples
+                                    # Ground truth is always first/top in static comparisons.
+                                    rgb = torch.stack([rgb_v[:, -t:], eval_image_samples], dim=2)[:b]
                                     rgb = (
                                         rearrange(
                                             rgb,
-                                            "b t e v h w c -> (b v e h) (t w) c",
+                                            "b t e v h w c -> (e b v h) (t w) c",
                                         )
                                         .cpu()
                                         .numpy()
                                     )
-                                    rgb_noised = torch.stack([noisy_eval_image_samples, rgb_v[:, -t:]], dim=2)[:b]
+                                    rgb = _label_comparison(rgb, "GROUND TRUTH", "IMAGINED", "height")
+                                    rgb_noised = torch.stack([rgb_v[:, -t:], noisy_eval_image_samples], dim=2)[:b]
                                     rgb_noised = (
                                         rearrange(
                                             rgb_noised,
-                                            "b t e v h w c -> (b v e h) (t w) c",
+                                            "b t e v h w c -> (e b v h) (t w) c",
                                         )
                                         .cpu()
                                         .numpy()
                                     )
-                                    animation = torch.stack(
-                                        [rgb_v[:, -t:], eval_image_samples, noisy_eval_image_samples], dim=2
-                                    )[:b]
+                                    rgb_noised = _label_comparison(
+                                        rgb_noised, "GROUND TRUTH", "IMAGINED (NOISY ACTIONS)", "height"
+                                    )
+                                    animation = torch.stack([rgb_v[:, -t:], eval_image_samples], dim=2)[:b]
                                     animation = (
                                         rearrange(
                                             animation,
@@ -1254,12 +1551,29 @@ def main(args, resume_preempt=False):
                                         .cpu()
                                         .numpy()
                                     )
+                                    animation = _label_comparison(
+                                        animation, "GROUND TRUTH", "IMAGINED", "width"
+                                    )
+                                    animation_noised = torch.stack(
+                                        [rgb_v[:, -t:], noisy_eval_image_samples], dim=2
+                                    )[:b]
+                                    animation_noised = (
+                                        rearrange(
+                                            animation_noised,
+                                            "b t e v h w c -> t c (b v h) (e w)",
+                                        )
+                                        .cpu()
+                                        .numpy()
+                                    )
+                                    animation_noised = _label_comparison(
+                                        animation_noised, "GROUND TRUTH", "IMAGINED (NOISY ACTIONS)", "width"
+                                    )
                                 else:
-                                    rgb, rgb_noised, animation = None, None, None
-                            return rgb, rgb_noised, animation, val_rollout_result
+                                    rgb, rgb_noised, animation, animation_noised = None, None, None, None
+                            return rgb, rgb_noised, animation, animation_noised, val_rollout_result
 
                         if do_data_traj_rollout_eval:
-                            rgb, rgb_noised, animation, eval_rollout_result = val_rollout(
+                            rgb, rgb_noised, animation, animation_noised, eval_rollout_result = val_rollout(
                                 video_features,
                                 action_features,
                                 proprio_features,
@@ -1299,9 +1613,21 @@ def main(args, resume_preempt=False):
                             if do_data_traj_rollout_eval:
                                 image_stats.update(
                                     {
-                                        "data_traj/image_rollouts": wandb.Image(rgb),
-                                        "data_traj/image_rollouts_noisy_actions": wandb.Image(rgb_noised),
-                                        "data_traj/image_animated_rollout": wandb.Video(animation, fps=6),
+                                        "data_traj/ground_truth_then_imagined": wandb.Image(rgb),
+                                        "data_traj/ground_truth_then_imagined_noisy_actions": wandb.Image(rgb_noised),
+                                        # Each video has ground truth on the left and imagination on the right.
+                                        "data_traj/ground_truth_vs_imagined": wandb.Video(
+                                            animation,
+                                            caption="Ground truth (left) | Imagined (right). Camera rows per episode: " + ", ".join(cfgs_camera.get("camera_views", [])),
+                                            fps=6,
+                                            format="gif",
+                                        ),
+                                        "data_traj/ground_truth_vs_imagined_noisy_actions": wandb.Video(
+                                            animation_noised,
+                                            caption="Ground truth (left) | Imagined with noisy actions (right). Camera rows per episode: " + ", ".join(cfgs_camera.get("camera_views", [])),
+                                            fps=6,
+                                            format="gif",
+                                        ),
                                     }
                                 )
                         world_model.train()
@@ -1349,19 +1675,22 @@ def main(args, resume_preempt=False):
                                     image_stats.update(viz_img_stats)
                     # First, use distributed validation data for metrics
                     for idx in range(len(val_loader_iters)):
+                        val_name = val_loader_names[idx]
                         obs, action, state, reward, masks_enc, masks_pred = get_batch(train=False, idx=idx)
                         with torch.no_grad():
                             (_, val_losses, _, val_total_stats, val_img_stats), gpu_etime_ms = gpu_timer(
-                                lambda: step_model(obs, action, state, reward, train=False)
+                                lambda: step_model(
+                                    obs, action, state, reward, train=False, head_key=val_loader_head_keys[idx]
+                                )
                             )
                             if not light_eval_only_mode:
-                                eval_losses.update({f"eval_data/load-{idx}/{k}": v for k, v in val_losses.items()})
-                                eval_total_stats.update(
-                                    {f"eval_data/load-{idx}/{k}": v for k, v in val_total_stats.items()}
-                                )
+                                # Optimizer/action diagnostics and zero-valued training losses only
+                                # add dashboard noise during eval. Rollout quality is the useful output.
+                                rollout_stats = {k: v for k, v in val_total_stats.items() if k.startswith("data_traj/")}
+                                eval_total_stats.update({f"eval/{val_name}/{k}": v for k, v in rollout_stats.items()})
                             # Only use distributed batch images if we don't have visualization images
                             if not val_viz_rank0_loader:
-                                prefixed_stats = {f"load-{idx}/{k}": v for k, v in val_img_stats.items()}
+                                prefixed_stats = {f"eval/{val_name}/{k}": v for k, v in val_img_stats.items()}
                                 if light_eval_only_mode:
                                     image_stats.update(
                                         {f"light_eval_only/epoch-{epoch+1}/{k}": v for k, v in prefixed_stats.items()}
@@ -1389,7 +1718,12 @@ def main(args, resume_preempt=False):
                             else:
                                 log_values.append(0.0)
                         train_csv_logger.log(*log_values)
-                        if (itr % log_freq == 0) or np.isnan(loss) or np.isinf(loss):
+                        if rank == 0:
+                            epoch_pbar.set_postfix(
+                                loss=f"{loss_meter.avg:.3f}",
+                                mem=f"{torch.cuda.max_memory_allocated() / 1024.0**3:.1f}GiB",
+                            )
+                        if np.isnan(loss) or np.isinf(loss):
                             logger.info(
                                 "[%d, %5d] "
                                 "[mem: %.2e] "

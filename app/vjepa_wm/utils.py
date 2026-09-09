@@ -25,6 +25,31 @@ logging.basicConfig(stream=sys.stdout, level=logging.INFO)
 logger = logging.getLogger()
 
 
+class PrecomputedTokenEncoder(torch.nn.Module):
+    """Stand-in for a live visual encoder when tokens are already precomputed.
+
+    Used for enc_type == "precomputed" (see VideoWM.encode_obs and
+    isaac_npz_dset.py's embedding_suffix): the dataset already returns DINO
+    patch embeddings straight from the trajectory NPZ (see
+    preprocess_dino.py), so there is no live encoder forward pass at all.
+    This class exists only so the rest of init_video_model -- which reads
+    encoder.patch_size, encoder.parameters(), etc. off a real nn.Module --
+    doesn't need a separate code path per predictor type. forward() is never
+    called; encode_obs's "precomputed" branch never invokes self.encoder.
+    """
+
+    def __init__(self, patch_size: int):
+        super().__init__()
+        self.patch_size = patch_size
+
+    def forward(self, x):
+        raise RuntimeError(
+            "PrecomputedTokenEncoder has no encoder to run -- visual tokens "
+            "should already be embedded upstream (isaac_npz_dset.py's "
+            "embedding_suffix path); check enc_type/embedding_suffix wiring."
+        )
+
+
 def clean_state_dict(state_dict):
     """Remove 'module.' prefix from state_dict keys."""
     out = {k.replace("module.", ""): v for k, v in state_dict.items()}
@@ -563,6 +588,14 @@ def init_video_model(
     # Image and frame parameters
     img_size=256,
     num_frames_pred=8,
+    # Needed only for enc_type == "precomputed" (derives the placeholder
+    # encoder's patch_size = img_size // grid_size). Every other enc_type
+    # gets its real patch_size from the loaded encoder itself; VideoWM
+    # separately receives grid_size directly (not through this function).
+    grid_size=14,
+    # Multiview: number of camera views concatenated per frame (see
+    # VideoWM.encode_obs). Used to size predictor attention masks and positions.
+    num_views=1,
     # Encoder configuration
     enc_type="vjepa",
     enc_version="v1",
@@ -575,6 +608,7 @@ def init_video_model(
     num_frames_enc=16,
     # Predictor architecture
     pred_type="dino_wm",
+    dino_wm_view_fusion="token",
     pred_depth=6,
     pred_embed_dim=384,
     embed_dim=1024,
@@ -592,6 +626,7 @@ def init_video_model(
     action_conditioning="token",
     action_tokens=1,
     action_emb_dim=0,
+    normalize_action_conditioning=False,
     action_encoder_inpred=False,
     act_mlp=False,
     use_action=True,
@@ -615,6 +650,10 @@ def init_video_model(
         local_window_h = cfgs_attn_pattern.get("local_window_h", -1)
         local_window_w = cfgs_attn_pattern.get("local_window_w", -1)
     local_window = (local_window_time, local_window_h, local_window_w)
+    if not use_proprio:
+        # Disable both input encoding and predictor conditioning without requiring
+        # users to also edit the saved proprioception widths/token counts.
+        proprio_dim, proprio_emb_dim, proprio_tokens = 0, 0, 0
     if use_action:
         if action_conditioning == "token":
             assert action_tokens > 0
@@ -690,6 +729,15 @@ def init_video_model(
         for p in encoder.parameters():
             p.requires_grad = False
         encoder = encoder.eval()
+    elif enc_type == "precomputed":
+        # No live encoder: the dataset (isaac_npz_dset.py's embedding_suffix)
+        # already returns DINO patch tokens read straight from the
+        # trajectory NPZ (see preprocess_dino.py), so there's nothing to
+        # build or load weights for here.
+        encoder = PrecomputedTokenEncoder(patch_size=img_size // grid_size).to(device)
+        encoder = encoder.eval()
+    else:
+        raise ValueError(f"Unknown enc_type: {enc_type!r}")
     logger.info(f"Encoder: {encoder}")
     assert (
         img_size % encoder.patch_size == 0
@@ -713,18 +761,23 @@ def init_video_model(
         assert action_encoder_inpred == False
         assert proprio_encoder_inpred == False
         assert action_conditioning == "feature" and proprio_encoding == "feature"
-        logger.info(f"Using DINO WM predictor with num_patches {int(img_size / encoder.patch_size) ** 2}")
-        concat_dim = 1
+        if dino_wm_view_fusion not in ("token", "feature"):
+            raise ValueError("dino_wm_view_fusion must be 'token' or 'feature'")
+        feature_views = num_views if dino_wm_view_fusion == "feature" else 1
+        num_patches = (num_views // feature_views) * (img_size // encoder.patch_size) ** 2
+        logger.info(f"Using DINO WM predictor with {num_patches} patches per frame ({num_views} views)")
         predictor = ViTPredictor(
             depth=pred_depth,
             heads=pred_num_heads,
             mlp_dim=2048,
             dropout=0.1,
-            num_patches=int(img_size / encoder.patch_size) ** 2,
+            num_patches=num_patches,
             num_frames=num_frames_pred,
-            dim=pred_embed_dim + (proprio_emb_dim * 1 + action_emb_dim * 1) * (concat_dim),
+            # DINO-WM concatenates encoder features directly, without an input projection.
+            dim=feature_views * embed_dim + proprio_emb_dim + action_emb_dim,
             use_sdpa=use_sdpa,
         ).to(device)
+        predictor.dino_wm_view_fusion = dino_wm_view_fusion
     elif pred_type == "vjepa2_ac":
         # works with both action_encoder_inpred False or True, with action_conditioning in [’feature’, ‘token’],
         # and with proprio_encoding in [’feature’, ‘token’]. The action_conditioning decides of the proprio_encoding
@@ -781,7 +834,11 @@ def init_video_model(
             proprio_encoding=proprio_encoding,
             proprio_emb_dim=proprio_emb_dim,
             proprio_tokens=proprio_tokens,
+            action_emb_dim=action_emb_dim,
+            use_proprio=use_proprio,
             init_scale_factor_adaln=init_scale_factor_adaln,
+            normalize_action_conditioning=normalize_action_conditioning,
+            num_views=num_views,
         ).to(device)
     logger.info(f"Predictor: {predictor}")
     pred_params = sum(p.numel() for p in predictor.parameters())
@@ -808,7 +865,7 @@ def init_video_model(
     else:
         action_encoder = None
     # Proprioceptive encoder should always be outside of the predictor, so that VideoWM.encode_proprio() really outputs a feature
-    if not proprio_encoder_inpred and (proprio_tokens > 0 or proprio_emb_dim > 0):
+    if use_proprio and not proprio_encoder_inpred and (proprio_tokens > 0 or proprio_emb_dim > 0):
         proprio_encoder = ProprioceptiveEmbedding(
             num_frames=num_frames_pred,
             tubelet_size=1,

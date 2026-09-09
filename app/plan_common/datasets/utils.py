@@ -15,6 +15,7 @@ import torch.utils.data
 from src.datasets.data_manager import init_data as init_data_src
 
 from .droid_dset import DROIDVideoDataset
+from .isaac_npz_dset import load_isaac_npz_slice_train_val
 from .metaworld_hf_dset import load_metaworld_hf_slice_train_val
 from .point_maze_dset import load_point_maze_slice_train_val
 from .pusht_dset import load_pusht_slice_train_val
@@ -66,6 +67,7 @@ def init_data(
     output_rcasa_info=False,
     # Validation parameters
     num_frames_val=None,
+    val_demo_types=None,
     val_dataset_batch_size=4,
     val_dataset_drop_last=False,
     val_dataset_fpcs=[16],
@@ -87,8 +89,32 @@ def init_data(
 ) -> tuple[Callable]:
     logger.info(f"📂 Data paths: {data_paths}")
     shuffle = True
-    if dataset_type == "custom":
-        if all("droid" in p for p in data_paths) or all("franka_custom" in p for p in data_paths):
+    if dataset_type in ("custom", "isaac_npz"):
+        if dataset_type == "isaac_npz":
+            datasets, traj_dsets = load_isaac_npz_slice_train_val(
+                transform=transform,
+                data_paths=data_paths,
+                normalize_action=normalize_action,
+                split_ratio=split_ratio,
+                num_hist=num_hist,
+                num_pred=num_pred,
+                num_frames_val=num_frames_val,
+                frameskip=frameskip,
+                action_skip=action_skip,
+                traj_subset=traj_subset,
+                random_seed=seed,
+                with_reward=with_reward,
+                process_actions=process_actions,
+                camera_views=camera_views,
+                dset_fraction=dset_fraction,
+                val_demo_types=val_demo_types,
+                filter_train_by_demo_types=kwargs.get("filter_train_by_demo_types", False),
+                action_key=kwargs.get("action_key", "action"),
+                embedding_suffix=kwargs.get("embedding_suffix"),
+            )
+            dataset = datasets["train"]
+            shuffle = True
+        elif all("droid" in p for p in data_paths) or all("franka_custom" in p for p in data_paths):
             # We never pass the normalize_action argument to DROIDVideoDataset
             dataset = DROIDVideoDataset(
                 data_path=data_paths[0],

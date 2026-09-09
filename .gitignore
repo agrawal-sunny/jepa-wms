@@ -26,3 +26,9 @@ MUJOCO_LOG.TXT
 
 macros.py
 CLAUDE.md
+
+# Logs / checkpoints (local, not for version control)
+logs/
+${JEPAWM_LOGS}/
+${JEPAWM_CKPT}/
+*.log

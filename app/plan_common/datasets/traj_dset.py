@@ -132,6 +132,20 @@ class TrajSlicerDataset(TrajDataset):
         time dimension for act can be lower than obs and state, if self.frameskip < self.action_skip.
         """
         i, start, end = self.slices[idx]
+        slice_dataset = self.dataset
+        slice_index = i
+        if isinstance(slice_dataset, TrajSubset):
+            slice_index = slice_dataset.indices[i]
+            slice_dataset = slice_dataset.dataset
+        if hasattr(slice_dataset, "get_slice"):
+            return slice_dataset.get_slice(
+                slice_index,
+                start=start,
+                end=end,
+                frameskip=self.frameskip,
+                action_skip=self.action_skip,
+                process_actions=self.process_actions,
+            )
         obs, act, state, reward, _ = self.dataset[i]
         # To avoid collator errors, create dummy tensors if state or reward from the traj_dset are None
         if reward is None:

@@ -114,6 +114,8 @@ class Attention(nn.Module):
         self.scale = dim_head**-0.5
         self.use_sdpa = use_sdpa
         self.dropout_p = dropout
+        self.num_patches = NUM_PATCHES
+        self.num_frames = NUM_FRAMES
 
         self.norm = nn.LayerNorm(dim)
 
@@ -139,8 +141,8 @@ class Attention(nn.Module):
         """
         if self._sdpa_mask is None or self._sdpa_mask_size < T:
             # Create boolean mask (True = attend, False = mask out)
-            self._sdpa_mask = generate_sdpa_mask(NUM_PATCHES, NUM_FRAMES, device=device)
-            self._sdpa_mask_size = NUM_FRAMES * NUM_PATCHES
+            self._sdpa_mask = generate_sdpa_mask(self.num_patches, self.num_frames, device=device)
+            self._sdpa_mask_size = self.num_frames * self.num_patches
 
         mask = self._sdpa_mask[:T, :T]
         # Ensure mask is on the correct device

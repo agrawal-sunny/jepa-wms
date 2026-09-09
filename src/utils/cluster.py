@@ -17,6 +17,11 @@ logger = get_logger("Cluster utils")
 # These should be set before running the code
 # See README.md for setup instructions
 JEPAWM_DSET = os.environ.get("JEPAWM_DSET", None)
+LIFT_ENV_DATASET_ROOT = os.environ.get("LIFT_ENV_DATASET_ROOT", "/data/sunny/lift_env")
+LIFT_ENV_DATASET_PATHS = {
+    "IsaacLiftEnvFranka": f"{LIFT_ENV_DATASET_ROOT}/franka/**/*.npz",
+    "IsaacLiftEnvUR": f"{LIFT_ENV_DATASET_ROOT}/ur/**/*.npz",
+}
 
 
 def slurm_account_partition_and_qos(low_pri: bool) -> tuple:
@@ -81,6 +86,10 @@ def _build_dataset_paths():
             "Robocasa": f"{dataset_root}/robocasa/",
             "DROID": f"{dataset_root}/DROID/droid_paths.csv",
             "Franka_hf": f"{dataset_root}/franka_custom",
+            # Isaac Lab NPZ episodes collected by x_embodiment_safety.
+            "IsaacTakeoffFranka": f"{dataset_root}/takeoff/dataset/franka/**/*.npz",
+            "IsaacTakeoffUR": f"{dataset_root}/takeoff/dataset/ur/**/*.npz",
+            **LIFT_ENV_DATASET_PATHS,
             # Video datasets
             "K400": f"{dataset_root}/kinetics400/k400_train_paths.csv",
             "K400_val": f"{dataset_root}/kinetics400/k400_val_paths.csv",
@@ -102,6 +111,8 @@ def get_dataset_path(dataset: str, cluster=None) -> str:
     Get the path for a specific dataset.
     Uses 'default' cluster if environment variables are set, otherwise tries the actual cluster name.
     """
+    if dataset in LIFT_ENV_DATASET_PATHS:
+        return LIFT_ENV_DATASET_PATHS[dataset]
     if cluster is None:
         cluster = clusterscope.cluster()
 
@@ -147,15 +158,20 @@ def get_dataset_paths(datasets: list[str], is_train: bool = True) -> list[str]:
 def dataset_paths() -> dict[str, str]:
     """
     Get all dataset paths for the current environment.
-    Uses 'default' if JEPAWM_DSET is set.
+    Uses 'default' if JEPAWM_DSET is set. LIFT_ENV_DATASET_PATHS is always
+    merged in -- those aliases read from LIFT_ENV_DATASET_ROOT independently
+    of JEPAWM_DSET (see get_dataset_path, which already honors this).
     """
     if JEPAWM_DSET is not None and "default" in DATASET_PATHS_BY_CLUSTER:
-        return DATASET_PATHS_BY_CLUSTER["default"]
+        return {**LIFT_ENV_DATASET_PATHS, **DATASET_PATHS_BY_CLUSTER["default"]}
 
     # Fallback to cluster-specific paths
     cluster = clusterscope.cluster()
     if cluster in DATASET_PATHS_BY_CLUSTER:
-        return DATASET_PATHS_BY_CLUSTER[cluster]
+        return {**LIFT_ENV_DATASET_PATHS, **DATASET_PATHS_BY_CLUSTER[cluster]}
+
+    if LIFT_ENV_DATASET_PATHS:
+        return dict(LIFT_ENV_DATASET_PATHS)
 
     logger.warning(
         "No dataset paths configured. "

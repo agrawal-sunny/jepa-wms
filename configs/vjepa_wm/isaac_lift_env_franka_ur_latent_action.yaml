@@ -1,0 +1,347 @@
+app: vjepa_wm
+nodes: 1
+tasks_per_node: 1
+cpus_per_task: 8
+folder: ${JEPAWM_LOGS}/isaac_lift_env_franka_ur_latent_action
+
+data:
+  dataset_type: isaac_npz
+  # This recursive alias includes random/, success/, and failure/.
+  datasets: [IsaacLiftEnvFranka, IsaacLiftEnvUR]
+  datasets_weights: null
+  seed: 234
+  img_size: 224
+  validation:
+    # Restrict metrics and rollout videos; training still uses all three demo types.
+    val_demo_types: [success, failure]
+    val_datasets: []
+    # Embodiment-pure eval loaders (see model.heads_cfg below): the combined
+    # val_datasets: [] loader above still gives an aggregate number, but its
+    # do_data_traj_rollout_eval visualizations/lpips always went through a
+    # single global image_head decoder finetuned only on Franka frames, even
+    # for UR samples. These two give each embodiment its own finetuned
+    # decoder via image_head_key (train.py's val_loader_head_keys).
+    val_datasets_1:
+      names: [IsaacLiftEnvFranka]
+      image_head_key: image_head
+      batch_size: 2
+      drop_last: false
+      fps: 20
+      fpcs: [8]
+      camera_views: [front_cam, wrist_cam]
+      droid_to_rcasa_action_format: false
+    val_datasets_2:
+      names: [IsaacLiftEnvUR]
+      image_head_key: image_head_ur
+      batch_size: 2
+      drop_last: false
+      fps: 20
+      fpcs: [8]
+      camera_views: [front_cam, wrist_cam]
+      droid_to_rcasa_action_format: false
+    # Same two loaders again, but split: train draws from that call's own
+    # *training* slice instead of its held-out one (still restricted to
+    # success/failure via val_demo_types + filter_train_by_demo_types) --
+    # so rollout visualizations also cover in-distribution training data,
+    # not only the held-out set.
+    val_datasets_3:
+      names: [IsaacLiftEnvFranka]
+      split: train
+      image_head_key: image_head
+      batch_size: 2
+      drop_last: false
+      fps: 20
+      fpcs: [8]
+      camera_views: [front_cam, wrist_cam]
+      droid_to_rcasa_action_format: false
+    val_datasets_4:
+      names: [IsaacLiftEnvUR]
+      split: train
+      image_head_key: image_head_ur
+      batch_size: 2
+      drop_last: false
+      fps: 20
+      fpcs: [8]
+      camera_views: [front_cam, wrist_cam]
+      droid_to_rcasa_action_format: false
+    num_frames_val: 8
+    val_dataset_batch_size: 2
+    val_dataset_drop_last: false
+    val_dataset_fpcs: [8]
+    val_dataset_camera_views: [front_cam, wrist_cam]
+    val_viz_rank0_loader: false
+  loader:
+    # Multiview (front+wrist concatenated) doubles tokens/frame; 8 OOMs even
+    # with activation checkpointing on this card. See model.use_activation_checkpointing.
+    # Raised from 2, mirroring isaac_lift_env_ur.yaml's fix: batch_size=2 was
+    # tuned to co-locate with the ur run on one 24GB card, but cuda:0 has
+    # ~14.5GB free with no other sunny job on it at the moment. Re-tune down
+    # if this OOMs cuda:0 (it's shared with other users, unlike cuda:1).
+    batch_size: 8
+    num_workers: 8
+    pin_mem: true
+    persistent_workers: true
+    drop_last: true
+  custom:
+    action_key: latent_action_lam
+    split_ratio: 0.9
+    frameskip: 1
+    action_skip: 1
+    state_skip: 1
+    normalize_action: false
+    traj_subset: true
+    filter_first_episodes: null
+    filter_tasks: null
+    num_hist: 3
+    num_pred: 1
+    with_reward: false
+    process_actions: concat
+    dset_fraction: 1.0
+    # Read precomputed DINOv2 patch tokens (preprocess_dino.py --encoder
+    # dino_v2, written into the trajectory NPZs as "{camera}_dino_v2") instead
+    # of raw RGB frames -- see model.visual_encoder.enc_type: precomputed
+    # below. Built to match this pipeline's live DinoEncoder exactly (same
+    # dinov2_vits14, x_norm_patchtokens, mean=std=0.5 normalize, 224px ->
+    # grid_size 16), so no other model/data settings changed.
+    embedding_suffix: dino_v2
+  camera:
+    camera_frame: false
+    # Sample both viewpoints in training; evaluation always includes both.
+    camera_views: [front_cam, wrist_cam]
+    droid_to_rcasa_action_format: false
+    rcasa_to_droid_action_format: false
+    fps: 20
+    dataset_fpcs: [4]
+    mpk_manifest_patterns: []
+
+data_aug:
+  auto_augment: false
+  random_horizontal_flip: false
+  motion_shift: false
+  random_resize_aspect_ratio: [1.0, 1.0]
+  random_resize_scale: [1.0, 1.0]
+  reprob: 0.0
+  normalize: [[0.5, 0.5, 0.5], [0.5, 0.5, 0.5]]
+
+logging:
+  write_tag: jepa
+  latest_format: pth.tar
+  wandb:
+    use_wandb: true
+    debug: false
+    project: jepa-wm-lift-franka-ur-latent-action
+    disable_wandb_media: false
+    log_media_locally: false
+
+loss:
+  cos_loss_weight: 0.0
+  l1_loss_weight: 0.0
+  l2_loss_weight: 1.0
+  smooth_l1_loss_weight: 0.0
+
+meta:
+  plan_only_eval_mode: false
+  light_eval_only_mode: false
+  quick_debug: false
+  freeze_encoder: true
+  load_checkpoint: true
+  load_opt_scale_epoch: true
+  read_checkpoint: null
+  pretrained_path: null
+  seed: 234
+  eval_freq: 50
+  light_eval_freq: 500
+  save_every_freq: -1
+  dtype: bfloat16
+  data_traj_rollout_eval:
+    do_data_traj_rollout_eval: true
+    # Was 5 (deeper than training's 2-step rollout): each light-eval trigger
+    # re-runs this over every context prefix, and eval's own peak VRAM was the
+    # actual gap between measured/estimated usage -- not the decoder or batch
+    # size. Matched to training's rollout depth instead of going deeper.
+    data_traj_eval_rollout_steps: 2
+    data_traj_decode_gt: false
+    data_traj_eval_ctxt_window: 3
+  energy_landscape_eval:
+    do_energy_landscape_eval: false
+
+model:
+  # Set false for a new run without proprioception; action output stays 384.
+  use_proprio: true
+  # JEPA-WM's own recipe for simulated environments -- per the paper
+  # (arXiv:2512.24497): AdaLN+RoPE predictor, DINOv2-S encoder, proprio
+  # conditioning kept (unlike the real-robot DROID/RoboCasa recipe, which
+  # drops proprio and uses DINOv3 ViT-L instead). Mirrors
+  # configs/vjepa_wm/mw_final_sweep/mw_4f_fsk5_ask1_r224_pred_AdaLN_ftprop_depth6_repro_2roll_save.yaml.
+  grid_size: 16
+  tubelet_size_enc: 1
+  # Recomputes predictor activations during backward instead of storing them
+  # (compute-for-memory tradeoff, no accuracy cost). Measured: batch_size=4
+  # peaks at ~4.4 GiB with this on vs ~13.6 GiB off.
+  use_activation_checkpointing: true
+  action_conditioning: token
+  proprio_encoding: feature
+  num_frames_pred: 4
+  visual_encoder:
+    # No live encoder forward pass: visual tokens are read precomputed from
+    # the trajectory NPZs (data.custom.embedding_suffix above) instead of
+    # running DinoEncoder on raw frames every step -- see
+    # app/vjepa_wm/utils.py's PrecomputedTokenEncoder and video_wm.py's
+    # encode_obs. enc_version below is kept only as documentation of which
+    # live encoder these tokens are equivalent to (dinov2_vits14,
+    # x_norm_patchtokens, mean=std=0.5 normalize); it is not read for this
+    # enc_type.
+    enc_type: precomputed
+    enc_version: dinov2_vits14
+    pretrain_enc_path: null
+    pretrain_enc_ckpt_key: target_encoder
+    embed_dim: 384
+    enc_use_rope: null
+    enc_name: null
+    use_sdpa_enc: true
+    num_frames_enc: 16
+    uniform_power: true
+  action_encoder:
+    action_tokens: 1
+    # Action bottleneck; AdaLN separately projects to 400 (384 visual + 16 proprio).
+    action_emb_dim: 384
+    act_mlp: false
+    action_encoder_inpred: true
+  proprio_encoder:
+    proprio_tokens: 0
+    proprio_emb_dim: 16
+    prop_mlp: false
+    proprio_encoder_inpred: false
+  predictor:
+    tubelet_size: 1
+    pred_num_heads: 16
+    pred_depth: 6
+    pred_embed_dim: 384
+    pred_use_extrinsics: false
+    pred_type: AdaLN
+    act_pred_projector: false
+    use_SiLU: false
+    use_rope: true
+    use_sdpa: false
+  wm_encoding:
+    batchify_video: true
+    dup_image: false
+    normalize_reps: false
+  rollout_cfg:
+    rollout_steps: 2
+    train_rollout_prefixes: random
+    rollout_stop_gradient: true
+    ctxt_window_train_rollout: 3
+    do_parallel_rollout: false
+    do_sequential_rollout: true
+    prepend_gt: false
+    sampling_scheduler:
+      type: linear
+      start: 0.0
+      end: 0.0
+  attn:
+    local_window_time: 3
+    local_window_h: -1
+    local_window_w: -1
+  # Pretrained decoder for rollout-visualization only -- never trained here
+  # (optimization.train_heads: false; frozen, loaded once at start-up).
+  # Points at the in-domain decoder finetuned on lift_env-franka frames
+  # (configs/vjepa_wm/lift_env_franka/step2_lpips_lift_env_franka_dinovits_224.yaml)
+  # rather than the generic cross-environment VM2M checkpoint, so rollout
+  # visualizations for this env look like the actual scene. Run that config
+  # first and update the path below to its checkpoint_folder if it differs
+  # (dinov2_vits_224_INet architecture is the JEPA-WM pairing per README's
+  # decoder-assignment table, not dinov2_vits_224 (05norm), which is DINO-WM's).
+  #
+  # num_views stays 1, matching how this checkpoint was (finetuned/)pretrained
+  # -- its view_tokens parameter is a fixed size that a different num_views
+  # can't load into. WorldModelViTImageHead.decode() instead folds our two
+  # camera views into the batch and decodes each one separately through this
+  # same num_views=1 decoder (see app/plan_common/models/wm_heads.py).
+  heads_cfg:
+    architectures:
+      image_head:
+        kind: vit
+        config:
+          patch_size: 8
+          in_chans: 3
+          img_size: [224, 224]
+          embed_dim: 384
+          decoder_embed_dim: 1024
+          depth: 24
+          num_heads: 16
+          mlp_ratio: 4.0
+          num_views: 1
+          use_activation_checkpointing: false
+          use_lpips: true
+          pixelloss_weight: 10
+          perceptual_weight: 1
+      # Same architecture, UR-finetuned weights -- selected for the
+      # val_datasets_2 (UR) eval loader via image_head_key above. train.py
+      # builds any "image_head"/"image_head_<suffix>" architecture entry.
+      image_head_ur:
+        kind: vit
+        config:
+          patch_size: 8
+          in_chans: 3
+          img_size: [224, 224]
+          embed_dim: 384
+          decoder_embed_dim: 1024
+          depth: 24
+          num_heads: 16
+          mlp_ratio: 4.0
+          num_views: 1
+          use_activation_checkpointing: false
+          use_lpips: true
+          pixelloss_weight: 10
+          perceptual_weight: 1
+    pretrain_dec_path:
+      image_head: ${JEPAWM_CKPT}/lift_env_franka/step2_lpips_lift_env_franka_dinovits_224/jepa-latest
+      # jepa-latest_image_head_ur.pth.tar is a symlink to the UR run's
+      # jepa-latest_image_head.pth.tar (added alongside the checkpoint,
+      # not committed by that training run) so the base-path +
+      # "_image_head_ur.pth.tar" convention below finds it under this key.
+      image_head_ur: ${JEPAWM_CKPT}/lift_env_ur/step2_lpips_lift_env_ur_dinovits_224/jepa-latest
+    # Trained by app/vjepa_wm/train.py itself (see save_checkpoint), so it
+    # follows the base-path + "_image_head.pth.tar" convention, unlike the
+    # public VM2M checkpoint which is the image-head file itself.
+    new_path_heads:
+      image_head: true
+      image_head_ur: true
+
+optimization:
+  main_optimizer: transition_model
+  # Load the pretrained image decoder for eval visualizations only.
+  train_heads: false
+  transition_model:
+    # Was 5000 (-> 100000 total with num_epochs: 20), matching DINO-WM's
+    # train_iter count exactly. That doesn't buy wall-clock parity though:
+    # even with the live encoder removed (model.visual_encoder.enc_type:
+    # precomputed), this predictor's activation-checkpointed AdaLN blocks +
+    # 2-step rollout run at ~0.96-1.1s/iter (measured from run-20260908-165152's
+    # own gpu-time(ms)/iter-time(ms) log columns), so 100k iters is
+    # ~27h -- the encoder was never the dominant cost. Cut to 1500 so
+    # 1500 * 20 = 30000 total iters, ~8h at the measured pace (matching
+    # dino_wm/train_dino_wm.py's actual wall-clock, not its iteration count).
+    iterations_per_epoch: 1500
+    ipe_scale: 1.0
+    clip_grad: 1
+    use_radamw: false
+    betas: [0.9, 0.999]
+    eps: 1.0e-8
+    weight_decay: 1.0e-7
+    final_weight_decay: 1.0e-6
+    # Twice the ~10-epoch validation plateau in run-20260904-175217, which
+    # used the dino_wm predictor; revisit once the AdaLN predictor's own
+    # validation curve is available.
+    # 20 epochs * 1500 iters/epoch (see iterations_per_epoch above) = 30000
+    # total steps, sized for an ~8h budget at the measured per-iter pace.
+    num_epochs: 20
+    warmup: 0
+    start_lr: 5.0e-4
+    ref_lr: 5.0e-4
+    final_lr: 5.0e-4
+    mixed_precision: true
+
+evals:
+  eval_cfg_paths: null
